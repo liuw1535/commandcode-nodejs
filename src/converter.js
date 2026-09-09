@@ -80,17 +80,29 @@ export function openaiToCommandCode(openaiReq, session) {
   const projectSlug = session?.projectSlug || config.PROJECT_SLUG || 'c-users-proxy-desktop';
   const messages = Array.isArray(openaiReq.messages) ? openaiReq.messages : [];
 
-  // Split out system messages -> commandcode system[] array.
+  // Extract the leading contiguous run of system messages into commandcode's
+  // system[] array. Scan from the start: skip leading non-system messages until
+  // the first system message, then collect the contiguous block of system
+  // messages that follows. Once that block ends (first non-system message after
+  // it), any later system messages are demoted to user messages in-place so the
+  // conversation order is preserved instead of being hoisted to the top.
   const systemTexts = [];
-  const nonSystem = [];
+  const normalized = [];
+  let phase = 0; // 0 = before first system, 1 = collecting run, 2 = run ended
   for (const m of messages) {
     if (m.role === 'system') {
-      const txt = typeof m.content === 'string'
-        ? m.content
-        : (Array.isArray(m.content) ? m.content.filter(p => p.type === 'text').map(p => p.text).join('\n') : '');
-      if (txt) systemTexts.push(txt);
+      if (phase === 2) {
+        normalized.push({ ...m, role: 'user' });
+      } else {
+        phase = 1;
+        const txt = typeof m.content === 'string'
+          ? m.content
+          : (Array.isArray(m.content) ? m.content.filter(p => p.type === 'text').map(p => p.text).join('\n') : '');
+        if (txt) systemTexts.push(txt);
+      }
     } else {
-      nonSystem.push(m);
+      if (phase === 1) phase = 2;
+      normalized.push(m);
     }
   }
   // Keep each system message as its own array element with its own cache_control,
@@ -117,9 +129,9 @@ export function openaiToCommandCode(openaiReq, session) {
     }
   }
 
-  // Convert non-system messages to commandcode format.
+  // Convert normalized messages to commandcode format.
   const ccMessages = [];
-  for (const m of nonSystem) {
+  for (const m of normalized) {
     if (m.role === 'user' || m.role === 'assistant') {
       const content = toCcContent(m.content);
       // OpenAI carries assistant thinking as a top-level `reasoning_content`

@@ -84,7 +84,7 @@ export const config = {
   PORT: num('PORT', 3000),
   HOST: str('HOST', '0.0.0.0'),
   AUTH_TOKEN: str('AUTH_TOKEN', ''),
-  MAX_BODY_BYTES: num('MAX_BODY_BYTES', 10 * 1024 * 1024),
+  MAX_BODY_BYTES: num('MAX_BODY_BYTES', 100 * 1024 * 1024),
 
   COMMANDCODE_BASE: str('COMMANDCODE_BASE', 'https://api.commandcode.ai'),
   CLI_VERSION: str('CLI_VERSION', '1.50.1'),
