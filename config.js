@@ -48,6 +48,14 @@ const DEFAULTS = {
   retry: { '429': { max: 3, baseMs: 1000 } },
   credentialsFile: './credentials.json',
   projectSlug: '',
+  warmup: {
+    // Credential fingerprint warmup policy.
+    //   'startup'    : warm all enabled creds in background at boot (legacy).
+    //   'lazy'       : warm on first rotation, await before first generate.
+    //   'lazy-async' : warm on first rotation in background (non-blocking).
+    //   'off'        : never warm up.
+    mode: 'startup',
+  },
   hardware: {
     machinePool: [
       { cpuModel: 'Intel(R) Core(TM) i3-1005G1 CPU @ 1.20GHz', cpuCount: 4, memGiB: [8, 12, 16, 20] },
@@ -162,6 +170,9 @@ const COMMANDCODE_ENDPOINTS = cfg.commandcode.endpoints;
 const PROJECT_SLUG = str(env.PROJECT_SLUG, cfg.projectSlug);
 const CREDENTIALS_FILE = str(env.CREDENTIALS_FILE, cfg.credentialsFile);
 
+// Credential warmup policy (see config.json warmup.mode).
+const WARMUP_MODE = str(env.WARMUP_MODE, cfg.warmup.mode);
+
 // Upstream model list refresh interval (the list itself is fetched from
 // /provider/v1/models at startup and on this timer; see src/modelProvider.js).
 const MODELS_REFRESH_MS = num(env.MODELS_REFRESH_MS, cfg.models.refreshMs);
@@ -214,6 +225,9 @@ export const config = {
 
   // Credentials
   CREDENTIALS_FILE,
+
+  // Warmup policy
+  WARMUP_MODE,
 
   // Models
   MODELS: { defaultModel: cfg.models.defaultModel },

@@ -4,7 +4,7 @@ import config from '../config.js';
 import log from '../logger.js';
 import { CredentialPool } from './credPool.js';
 import { openaiToCommandCode, commandCodeEventsToOpenAI } from './converter.js';
-import { buildGenerateHeaders, getSessionForToken } from './fingerprint.js';
+import { buildGenerateHeaders, getSessionForToken, ensureWarmed } from './fingerprint.js';
 import { emitApiSpan } from './telemetry.js';
 import { pipeStream } from './streamMapper.js';
 import { getModels } from './modelProvider.js';
@@ -132,6 +132,8 @@ export function createServer(credPool) {
       let upstreamRes;
       try {
         upstreamRes = await credPool.requestWithRotation(async (token) => {
+          const cred = credPool.find(token);
+          await ensureWarmed(token, cred?.name, config.WARMUP_MODE);
           const session = getSessionForToken(token);
           // Convert inside the rotation callback so workingDir/x-project-slug
           // always match the credential that actually serves this request.

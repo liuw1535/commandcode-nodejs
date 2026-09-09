@@ -19,12 +19,28 @@ async function main() {
     process.exit(1);
   }
 
-  // Warm up fingerprints in the background (best-effort) so the server
-  // starts immediately and isn't blocked by network timeouts.
-  const warmupCreds = credPool.creds.filter(c => c.enabled);
-  log.info(`[startup] warming up ${warmupCreds.length} credential(s) in background...`);
-  Promise.allSettled(warmupCreds.map(c => warmup(c.token, c.name)))
-    .then(() => log.info('[startup] warmup complete'));
+  // Warm up fingerprints according to config.WARMUP_MODE:
+  //   'startup'    -> fan out warmup for every enabled credential now (legacy).
+  //   'lazy' / 'lazy-async' -> warm per credential on first rotation
+  //                           (handled in openaiServer via ensureWarmed).
+  //   'off'        -> no warmup at all.
+  switch (config.WARMUP_MODE) {
+    case 'lazy':
+    case 'lazy-async':
+      log.info(`[startup] warmup mode=${config.WARMUP_MODE} (on-demand at first rotation; ${config.WARMUP_MODE === 'lazy' ? 'blocking first request' : 'non-blocking'})`);
+      break;
+    case 'off':
+      log.info('[startup] warmup mode=off (no fingerprint warmup)');
+      break;
+    case 'startup':
+    default: {
+      const warmupCreds = credPool.creds.filter(c => c.enabled);
+      log.info(`[startup] warmup mode=startup, warming up ${warmupCreds.length} credential(s) in background...`);
+      Promise.allSettled(warmupCreds.map(c => warmup(c.token, c.name)))
+        .then(() => log.info('[startup] warmup complete'));
+      break;
+    }
+  }
 
   // Fetch the upstream model list (best-effort; non-fatal on failure) and
   // start the periodic background refresher.

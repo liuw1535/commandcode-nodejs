@@ -76,7 +76,7 @@ function makeSession() {
   return {
     sessionId, installId, threadId, components, thumbmark,
     nodeVersion, pid, projectSlug,
-    user: null, warmed: false,
+    user: null, warmed: false, warming: null,
   };
 }
 
@@ -225,8 +225,39 @@ export function buildGenerateHeaders(token, sessionId, threadId) {
   };
 }
 
+// Ensure a credential is warmed up according to the configured policy.
+// Returns the session (so callers can reuse it for generate headers).
+//   mode 'lazy'       : on first use, AWAIT warmup completion before returning
+//                       (the first /alpha/generate on this token waits for the
+//                        whoami/lifecycle/fingerprint/billing sequence).
+//   mode 'lazy-async' : on first use, KICK OFF warmup in the background and
+//                       return immediately — generate is sent right away while
+//                       warmup races alongside. The session object (sessionId /
+//                       installId / threadId / fingerprint) is built synchronously
+//                       by getSession, so generate headers don't depend on
+//                       warmup's network results.
+//   mode 'startup'    : warmup already ran at boot; no-op here.
+//   mode 'off'        : never warm; no-op.
+// Idempotent: an in-flight warmup promise is stored on the session and reused,
+// so concurrent first-uses of the same token don't trigger duplicate warmups.
+// A failed warmup leaves s.warmed=false, so the next lazy use retries.
+export async function ensureWarmed(token, name, mode) {
+  const s = getSession(token);
+  if (mode !== 'lazy' && mode !== 'lazy-async') return s; // startup / off: no-op
+  if (s.warmed) return s;
+  if (!s.warming) {
+    const label = name || token.slice(-6);
+    log.info(`[fingerprint] ${label} on-demand warmup triggered (mode=${mode})`);
+    s.warming = warmup(token, name)
+      .catch(() => {}) // warmup logs internally; swallow to always settle
+      .finally(() => { s.warming = null; });
+  }
+  if (mode === 'lazy') await s.warming;
+  return s;
+}
+
 export function getSessionForToken(token) {
   return getSession(token);
 }
 
-export default { warmup, buildGenerateHeaders, getSessionForToken };
+export default { warmup, ensureWarmed, buildGenerateHeaders, getSessionForToken };

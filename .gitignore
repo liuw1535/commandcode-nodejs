@@ -1,2 +1,4 @@
 node_modules
 *.txt
+credentials.json
+config.json
