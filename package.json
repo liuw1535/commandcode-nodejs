@@ -1,0 +1,14 @@
+{
+  "name": "commandcode-openai-proxy",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "OpenAI-compatible proxy for Command Code (api.commandcode.ai) with fingerprint simulation and credential rotation.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true
+}
