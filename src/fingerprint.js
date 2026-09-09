@@ -93,7 +93,7 @@ function baseHeaders(token, extra = {}) {
     'content-type': 'application/json, application/json',
     'x-cli-environment': 'production',
     'Authorization': `Bearer ${token}`,
-    'User-Agent': 'cli',
+    'User-Agent': config.COMMANDCODE_USER_AGENT,
     'x-command-code-version': config.CLI_VERSION,
     'accept': '*/*',
     'accept-language': '*',
@@ -115,7 +115,7 @@ export async function warmup(token, name) {
   const label = name || token.slice(-6);
   try {
     // 1. whoami
-    const who = await ccFetch('/alpha/whoami', token, { method: 'GET' });
+    const who = await ccFetch(config.COMMANDCODE_ENDPOINTS.whoami, token, { method: 'GET' });
     if (who.ok) {
       const j = await who.json().catch(() => null);
       if (j?.user) s.user = j.user;
@@ -134,7 +134,7 @@ export async function warmup(token, name) {
         os: config.FINGERPRINT.os,
       },
     };
-    const life = await ccFetch('/alpha/lifecycle-events', token, {
+    const life = await ccFetch(config.COMMANDCODE_ENDPOINTS.lifecycleEvents, token, {
       method: 'POST',
       headers: { 'content-type': 'application/json, application/json' },
       body: JSON.stringify(lifeBody),
@@ -143,7 +143,7 @@ export async function warmup(token, name) {
 
     // 3. fingerprint/record
     const fpBody = { thumbmark: s.thumbmark, components: s.components };
-    const fp = await ccFetch('/alpha/fingerprint/record', token, {
+    const fp = await ccFetch(config.COMMANDCODE_ENDPOINTS.fingerprintRecord, token, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(fpBody),
@@ -151,8 +151,8 @@ export async function warmup(token, name) {
     log.info(`[fingerprint] ${label} fingerprint/record status=${fp.status}`);
 
     // 4. billing探测 (non-blocking)
-    const subs = await ccFetch('/alpha/billing/subscriptions', token, { method: 'GET' }).catch(() => null);
-    const cred = await ccFetch('/alpha/billing/credits', token, { method: 'GET' }).catch(() => null);
+    const subs = await ccFetch(config.COMMANDCODE_ENDPOINTS.billingSubscriptions, token, { method: 'GET' }).catch(() => null);
+    const cred = await ccFetch(config.COMMANDCODE_ENDPOINTS.billingCredits, token, { method: 'GET' }).catch(() => null);
     if (subs?.ok) {
       const j = await subs.json().catch(() => null);
       log.info(`[fingerprint] ${label} subscription plan=${j?.data?.planId || 'unknown'} status=${j?.data?.status || 'unknown'}`);
@@ -180,7 +180,7 @@ export function buildGenerateHeaders(token, sessionId, threadId) {
     'host': 'api.commandcode.ai',
     'connection': 'keep-alive',
     'content-type': 'application/json, application/json',
-    'User-Agent': 'cli',
+    'User-Agent': config.COMMANDCODE_USER_AGENT,
     'x-command-code-version': config.CLI_VERSION,
     'x-cli-environment': 'production',
     'x-project-slug': s.projectSlug,

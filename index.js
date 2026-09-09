@@ -4,6 +4,7 @@ import log from './logger.js';
 import { CredentialPool } from './src/credPool.js';
 import { warmup } from './src/fingerprint.js';
 import { createServer } from './src/openaiServer.js';
+import { init as initModels, getModelIds } from './src/modelProvider.js';
 
 async function main() {
   if (!config.AUTH_TOKEN) {
@@ -25,10 +26,15 @@ async function main() {
   Promise.allSettled(warmupCreds.map(c => warmup(c.token, c.name)))
     .then(() => log.info('[startup] warmup complete'));
 
+  // Fetch the upstream model list (best-effort; non-fatal on failure) and
+  // start the periodic background refresher.
+  await initModels();
+  const modelIds = getModelIds();
+  log.info(`[startup] models: ${modelIds.length ? modelIds.join(', ') : '(upstream fetch pending — passthrough active)'}`);
+
   const server = createServer(credPool);
   server.listen(config.PORT, config.HOST, () => {
     log.info(`[startup] listening on ${config.HOST}:${config.PORT}`);
-    log.info(`[startup] models: ${[...new Set(Object.values(config.MODEL_MAP))].join(', ')}`);
   });
 
   const shutdown = (sig) => {

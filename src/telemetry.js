@@ -38,9 +38,9 @@ export async function emitApiSpan({
 
     const resource = {
       attributes: [
-        attr('service.name', 'command-code-cli'),
+        attr('service.name', config.TELEMETRY.serviceName),
         attr('service.version', config.CLI_VERSION),
-        attr('process.executable.name', 'node.exe'),
+        attr('process.executable.name', config.TELEMETRY.processExecutableName),
         attr('process.runtime.name', 'node'),
         attr('process.runtime.version', session?.nodeVersion || process.version),
         attr('process.pid', session?.pid || process.pid),
@@ -85,7 +85,7 @@ export async function emitApiSpan({
     const payload = {
       resourceSpans: [{
         resource,
-        scopeSpans: [{ scope: { name: 'command-code-cli' }, spans: [chatSpan, agentSpan] }],
+        scopeSpans: [{ scope: { name: config.TELEMETRY.serviceName }, spans: [chatSpan, agentSpan] }],
       }],
     };
 
@@ -95,12 +95,12 @@ export async function emitApiSpan({
           'Authorization': `Bearer ${config.TELEMETRY.axiom.token}`,
           'X-Axiom-Dataset': config.TELEMETRY.axiom.dataset,
           'Content-Type': 'application/json',
-          'User-Agent': 'OTel-OTLP-Exporter-JavaScript/0.221.0',
+          'User-Agent': config.TELEMETRY.otelUserAgent,
         } },
       { url: config.TELEMETRY.claicode.url, headers: {
           'Authorization': `Bearer ${config.TELEMETRY.claicode.token}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'OTel-OTLP-Exporter-JavaScript/0.221.0',
+          'User-Agent': config.TELEMETRY.otelUserAgent,
         } },
     ];
 

@@ -3,10 +3,11 @@ import http from 'node:http';
 import config from '../config.js';
 import log from '../logger.js';
 import { CredentialPool } from './credPool.js';
-import { openaiToCommandCode, commandCodeEventsToOpenAI, reverseModel } from './converter.js';
+import { openaiToCommandCode, commandCodeEventsToOpenAI } from './converter.js';
 import { buildGenerateHeaders, getSessionForToken } from './fingerprint.js';
 import { emitApiSpan } from './telemetry.js';
 import { pipeStream } from './streamMapper.js';
+import { getModels } from './modelProvider.js';
 
 // OpenAI-shaped error JSON.
 function openaiError(res, status, message, code, type) {
@@ -74,12 +75,10 @@ export function createServer(credPool) {
       }
     }
 
-    // Models list
+    // Models list — served from the cached upstream /provider/v1/models
+    // response (OpenAI-format model array, as-is).
     if (method === 'GET' && path === '/v1/models') {
-      const models = [...new Set(Object.values(config.MODEL_MAP))].map(id => ({
-        id: reverseModel(id), object: 'model', owned_by: 'commandcode',
-      }));
-      const body = JSON.stringify({ object: 'list', data: models });
+      const body = JSON.stringify({ object: 'list', data: getModels() });
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(body);
       return done(200);
@@ -122,7 +121,7 @@ export function createServer(credPool) {
 
       const stream = openaiReq.stream === true;
       const includeUsage = !!(openaiReq.stream_options && openaiReq.stream_options.include_usage);
-      const openaiModel = openaiReq.model || 'glm-5.2';
+      const openaiModel = openaiReq.model || config.MODELS.defaultModel;
 
       // Captured inside the rotation callback so telemetry can mirror the
       // credential that actually served the request.
@@ -141,7 +140,7 @@ export function createServer(credPool) {
           usedSession = session;
           usedThreadId = ccBody.threadId;
           usedModel = ccBody.params.model;
-          return fetch(config.COMMANDCODE_BASE + '/alpha/generate', {
+          return fetch(config.COMMANDCODE_BASE + config.COMMANDCODE_ENDPOINTS.generate, {
             method: 'POST',
             headers,
             body: JSON.stringify(ccBody),

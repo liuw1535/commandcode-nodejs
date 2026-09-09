@@ -3,21 +3,15 @@
 import crypto from 'node:crypto';
 import config from '../config.js';
 import { getSessionForToken } from './fingerprint.js';
+import { resolveModel } from './modelProvider.js';
 
 const { randomUUID } = crypto;
 
-// OpenAI-facing model name -> commandcode model id (case-insensitive lookup).
+// OpenAI-facing model name -> upstream model id.
+// Case-insensitive match against the cached upstream model list; unknown
+// names pass through verbatim (the upstream will reject if invalid).
 export function mapModel(openaiModel) {
-  if (!openaiModel) return config.MODEL_MAP['glm-5.2'] || 'zai-org/GLM-5.2';
-  const k = String(openaiModel).toLowerCase();
-  if (config.MODEL_MAP[k]) return config.MODEL_MAP[k];
-  // passthrough unknown names verbatim
-  return openaiModel;
-}
-
-// commandcode model id -> OpenAI-facing name (reverse map; fallback to id).
-export function reverseModel(ccModel) {
-  return config.MODEL_REVERSE[ccModel] || ccModel || 'glm-5.2';
+  return resolveModel(openaiModel) || config.MODELS.defaultModel;
 }
 
 function today() {
@@ -272,7 +266,7 @@ export function commandCodeEventsToOpenAI(events, openaiModel) {
     id: 'chatcmpl-' + randomUUID(),
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
-    model: openaiModel || 'glm-5.2',
+    model: openaiModel || config.MODELS.defaultModel,
     choices: [{
       index: 0,
       message,
@@ -284,4 +278,4 @@ export function commandCodeEventsToOpenAI(events, openaiModel) {
   return resp;
 }
 
-export default { mapModel, reverseModel, openaiToCommandCode, commandCodeEventsToOpenAI };
+export default { mapModel, openaiToCommandCode, commandCodeEventsToOpenAI };
