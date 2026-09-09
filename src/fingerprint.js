@@ -5,6 +5,7 @@
 import crypto from 'node:crypto';
 import config from '../config.js';
 import log from '../logger.js';
+import { emitStartupSpans, emitWarmupApiSpans } from './telemetry.js';
 
 const { randomUUID } = crypto;
 
@@ -37,6 +38,9 @@ function makeSession() {
   // Per-credential install id: each account looks like a separate CLI install
   // on a separate machine. A shared install id would correlate all accounts.
   const installId = randomUUID();
+  // Per-credential thread id: stays stable across a "conversation" the way the
+  // real CLI keeps one threadId / x-session-id for the session. Rotating it per
+  // request is a tell; pin it per credential instead.
   const threadId = randomUUID();
 
   // Per-credential hardware profile, drawn from the machine pool so that N
@@ -103,6 +107,16 @@ function baseHeaders(token, extra = {}) {
   };
 }
 
+// time(method, path): run fetch and record (method, path, status, startNs, endNs)
+// for the warmup telemetry burst. Best-effort; never throws on telemetry.
+async function timedFetch(path, token, init, rec, label) {
+  const startNs = BigInt(Date.now()) * 1000000n;
+  const res = await ccFetch(path, token, init);
+  const endNs = BigInt(Date.now()) * 1000000n;
+  rec.push({ method: init?.method || 'GET', url: path, status: res.status, startNs, endNs });
+  return res;
+}
+
 async function ccFetch(path, token, init = {}) {
   const url = config.COMMANDCODE_BASE + path;
   const headers = baseHeaders(token, init.headers);
@@ -110,12 +124,17 @@ async function ccFetch(path, token, init = {}) {
 }
 
 // Run the full startup telemetry sequence for a credential. Best-effort.
+// Also emits OTel startup + api spans (axiom + claicode), mirroring the CLI.
 export async function warmup(token, name) {
   const s = getSession(token);
   const label = name || token.slice(-6);
+  const apiCalls = [];
   try {
+    // Emit the session:cli + command:interactive startup span first, like the CLI.
+    emitStartupSpans({ session: s, projectSlug: s.projectSlug }).catch(() => {});
+
     // 1. whoami
-    const who = await ccFetch(config.COMMANDCODE_ENDPOINTS.whoami, token, { method: 'GET' });
+    const who = await timedFetch(config.COMMANDCODE_ENDPOINTS.whoami, token, { method: 'GET' }, apiCalls);
     if (who.ok) {
       const j = await who.json().catch(() => null);
       if (j?.user) s.user = j.user;
@@ -134,25 +153,29 @@ export async function warmup(token, name) {
         os: config.FINGERPRINT.os,
       },
     };
-    const life = await ccFetch(config.COMMANDCODE_ENDPOINTS.lifecycleEvents, token, {
+    const life = await timedFetch(config.COMMANDCODE_ENDPOINTS.lifecycleEvents, token, {
       method: 'POST',
       headers: { 'content-type': 'application/json, application/json' },
       body: JSON.stringify(lifeBody),
-    });
+    }, apiCalls);
     log.info(`[fingerprint] ${label} lifecycle-events status=${life.status}`);
 
     // 3. fingerprint/record
     const fpBody = { thumbmark: s.thumbmark, components: s.components };
-    const fp = await ccFetch(config.COMMANDCODE_ENDPOINTS.fingerprintRecord, token, {
+    const fp = await timedFetch(config.COMMANDCODE_ENDPOINTS.fingerprintRecord, token, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(fpBody),
-    });
+    }, apiCalls);
     log.info(`[fingerprint] ${label} fingerprint/record status=${fp.status}`);
 
     // 4. billing探测 (non-blocking)
-    const subs = await ccFetch(config.COMMANDCODE_ENDPOINTS.billingSubscriptions, token, { method: 'GET' }).catch(() => null);
-    const cred = await ccFetch(config.COMMANDCODE_ENDPOINTS.billingCredits, token, { method: 'GET' }).catch(() => null);
+    const subs = await timedFetch(config.COMMANDCODE_ENDPOINTS.billingSubscriptions, token, { method: 'GET' }, apiCalls).catch(e => {
+      log.warn(`[fingerprint] ${label} subscriptions error: ${e?.message || e}`); return null;
+    });
+    const cred = await timedFetch(config.COMMANDCODE_ENDPOINTS.billingCredits, token, { method: 'GET' }, apiCalls).catch(e => {
+      log.warn(`[fingerprint] ${label} credits error: ${e?.message || e}`); return null;
+    });
     if (subs?.ok) {
       const j = await subs.json().catch(() => null);
       log.info(`[fingerprint] ${label} subscription plan=${j?.data?.planId || 'unknown'} status=${j?.data?.status || 'unknown'}`);
@@ -167,10 +190,16 @@ export async function warmup(token, name) {
   } catch (e) {
     log.warn(`[fingerprint] ${label} warmup error: ${e?.message || e}`);
   }
+
+  // Emit one api:METHOD:url span per commandcode call made above (axiom+claicode).
+  emitWarmupApiSpans({ session: s, user: s.user, apiCalls }).catch(() => {});
   return s;
 }
 
-// Headers for /alpha/generate requests (includes traceparent fingerprint).
+// Headers for /alpha/generate requests. x-session-id uses the threadId (UUID),
+// matching the captured CLI (the header carries the thread/conversation id,
+// NOT the sess_ session id). Returns traceId + chatSpanId so the OTel span
+// emitted afterwards shares the same traceparent identity.
 export function buildGenerateHeaders(token, sessionId, threadId) {
   const s = getSession(token);
   const traceId = randomHex(16);
@@ -185,13 +214,14 @@ export function buildGenerateHeaders(token, sessionId, threadId) {
     'x-cli-environment': 'production',
     'x-project-slug': s.projectSlug,
     'x-taste-learning': 'true',
-    'x-session-id': sessionId,
+    'x-session-id': threadId,
     'Authorization': `Bearer ${token}`,
     'traceparent': traceparent,
     'accept': '*/*',
     'accept-language': '*',
     'sec-fetch-mode': 'cors',
     'accept-encoding': 'br, gzip, deflate',
+    _trace: { traceId, spanId },
   };
 }
 

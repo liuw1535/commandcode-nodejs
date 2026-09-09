@@ -171,7 +171,10 @@ export function openaiToCommandCode(openaiReq, session) {
     }
   }
 
-  const threadId = openaiReq.threadId || randomUUID();
+  // threadId doubles as the x-session-id header. The real CLI keeps one
+  // threadId for the whole session; we pin it per credential (stable) unless
+  // the caller passes one explicitly. Rotating it per request is a tell.
+  const threadId = openaiReq.threadId || session?.threadId || randomUUID();
   const tools = toCcTools(openaiReq.tools);
 
   const params = {
@@ -260,6 +263,7 @@ export function commandCodeEventsToOpenAI(events, openaiModel) {
     prompt_tokens: usage.inputTokens ?? 0,
     completion_tokens: usage.outputTokens ?? 0,
     total_tokens: usage.totalTokens ?? ((usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)),
+    ...(typeof usage.cachedInputTokens === 'number' ? { cachedInputTokens: usage.cachedInputTokens } : {}),
   } : undefined;
 
   const resp = {

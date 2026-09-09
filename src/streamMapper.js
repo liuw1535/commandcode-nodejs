@@ -24,6 +24,8 @@ function mapFinish(fr) {
 export async function pipeStream({ res, upstream, openaiModel, includeUsage }) {
   const id = 'chatcmpl-' + randomUUID();
   const created = Math.floor(Date.now() / 1000);
+  const startMs = Date.now();
+  let ttftMs = null; // time to first token delta (text/reasoning/tool)
 
   // first chunk: role delta
   sseData(res, {
@@ -77,20 +79,26 @@ export async function pipeStream({ res, upstream, openaiModel, includeUsage }) {
         let ev;
         try { ev = JSON.parse(line); } catch { continue; }
 
+        const maybeMarkTtft = () => {
+          if (ttftMs === null) ttftMs = Date.now() - startMs;
+        };
         switch (ev.type) {
           case 'reasoning-delta':
+            maybeMarkTtft();
             sseData(res, {
               id, object: 'chat.completion.chunk', created, model: openaiModel,
               choices: [{ index: 0, delta: { reasoning_content: ev.text || '' }, finish_reason: null }],
             });
             break;
           case 'text-delta':
+            maybeMarkTtft();
             sseData(res, {
               id, object: 'chat.completion.chunk', created, model: openaiModel,
               choices: [{ index: 0, delta: { content: ev.text || '' }, finish_reason: null }],
             });
             break;
           case 'tool-input-start':
+            maybeMarkTtft();
             // Register the tool (assigns its stable index). Do not overwrite
             // any existing entry — a parallel tool may have started earlier.
             getTool(ev.id, ev.toolName);
@@ -175,7 +183,10 @@ export async function pipeStream({ res, upstream, openaiModel, includeUsage }) {
     inputTokens: lastUsage?.inputTokens ?? null,
     outputTokens: lastUsage?.outputTokens ?? null,
     totalTokens: lastUsage?.totalTokens ?? null,
+    cachedInputTokens: lastUsage?.cachedInputTokens ?? null,
     finishReasons: [finishReason],
+    ttftMs,
+    durationMs: Date.now() - startMs,
   };
 }
 

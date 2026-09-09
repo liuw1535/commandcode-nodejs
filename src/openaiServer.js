@@ -126,6 +126,8 @@ export function createServer(credPool) {
       // Captured inside the rotation callback so telemetry can mirror the
       // credential that actually served the request.
       let usedToken = null, usedSession = null, usedThreadId = null, usedModel = null;
+      let usedTrace = null, usedToolCount = 0, usedHadToolCalls = false;
+      const reqStartNs = BigInt(Date.now()) * 1000000n;
 
       let upstreamRes;
       try {
@@ -140,6 +142,8 @@ export function createServer(credPool) {
           usedSession = session;
           usedThreadId = ccBody.threadId;
           usedModel = ccBody.params.model;
+          usedTrace = headers._trace; delete headers._trace;
+          usedToolCount = Array.isArray(ccBody.params.tools) ? ccBody.params.tools.length : 0;
           return fetch(config.COMMANDCODE_BASE + config.COMMANDCODE_ENDPOINTS.generate, {
             method: 'POST',
             headers,
@@ -180,14 +184,23 @@ export function createServer(credPool) {
         // Emit OTel telemetry span mirroring the served credential.
         // Silent on success, warns only on failure (see telemetry.js).
         if (usedToken && pipeResult) {
+          usedHadToolCalls = pipeResult.finishReasons?.some(r => r === 'tool_calls');
           emitApiSpan({
-            token: usedToken,
             session: usedSession,
             threadId: usedThreadId,
             model: usedModel,
             inputTokens: pipeResult.inputTokens,
             outputTokens: pipeResult.outputTokens,
+            cachedInputTokens: pipeResult.cachedInputTokens,
             finishReasons: pipeResult.finishReasons,
+            ttftMs: pipeResult.ttftMs,
+            toolCount: usedToolCount,
+            hadToolCalls: usedHadToolCalls,
+            startNs: reqStartNs,
+            endNs: BigInt(Date.now()) * 1000000n,
+            traceId: usedTrace?.traceId,
+            chatSpanId: usedTrace?.spanId,
+            user: usedSession?.user,
           }).catch(() => { });
         }
         return done(200);
@@ -199,9 +212,11 @@ export function createServer(credPool) {
           resp.model = openaiModel;
           // Extract usage for telemetry if present.
           let nsInput = null, nsOutput = null, nsFinish = [];
+          let nsCached = null;
           if (resp.usage) {
             nsInput = resp.usage.prompt_tokens;
             nsOutput = resp.usage.completion_tokens;
+            if (typeof resp.usage.cachedInputTokens === 'number') nsCached = resp.usage.cachedInputTokens;
           }
           if (resp.choices?.[0]?.finish_reason) nsFinish = [resp.choices[0].finish_reason];
           const body = JSON.stringify(resp);
@@ -209,13 +224,20 @@ export function createServer(credPool) {
           res.end(body);
           if (usedToken) {
             emitApiSpan({
-              token: usedToken,
               session: usedSession,
               threadId: usedThreadId,
               model: usedModel,
               inputTokens: nsInput,
               outputTokens: nsOutput,
               finishReasons: nsFinish,
+              cachedInputTokens: nsCached,
+              toolCount: usedToolCount,
+              hadToolCalls: nsFinish.some(r => r === 'tool_calls'),
+              startNs: reqStartNs,
+              endNs: BigInt(Date.now()) * 1000000n,
+              traceId: usedTrace?.traceId,
+              chatSpanId: usedTrace?.spanId,
+              user: usedSession?.user,
             }).catch(() => { });
           }
           return done(200);
