@@ -93,8 +93,11 @@ export function openaiToCommandCode(openaiReq, session) {
       nonSystem.push(m);
     }
   }
+  // Keep each system message as its own array element with its own cache_control,
+  // matching the real CLI's per-segment caching (x-system-prompt-breakdown counts
+  // segments separately). Joining them into one block breaks prompt-cache boundaries.
   const system = systemTexts.length
-    ? [{ type: 'text', text: systemTexts.join('\n\n'), cache_control: { type: 'ephemeral' } }]
+    ? systemTexts.map(txt => ({ type: 'text', text: txt, cache_control: { type: 'ephemeral' } }))
     : undefined;
 
   // Build a toolCallId -> toolName lookup from prior assistant tool_calls.
@@ -119,6 +122,14 @@ export function openaiToCommandCode(openaiReq, session) {
   for (const m of nonSystem) {
     if (m.role === 'user' || m.role === 'assistant') {
       const content = toCcContent(m.content);
+      // OpenAI carries assistant thinking as a top-level `reasoning_content`
+      // string (sibling of `content`), while commandcode expects it as a
+      // {type:"reasoning"} block inside the content array. Promote it so
+      // multi-turn history preserves the reasoning. Place it before text to
+      // match commandcode's ordering (reasoning precedes the answer).
+      if (m.role === 'assistant' && typeof m.reasoning_content === 'string' && m.reasoning_content) {
+        content.unshift({ type: 'reasoning', text: m.reasoning_content });
+      }
       // assistant tool_calls -> tool-call blocks
       if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {

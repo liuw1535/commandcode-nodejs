@@ -110,6 +110,7 @@ export function createServer(credPool) {
       let openaiReq;
       try {
         openaiReq = JSON.parse(raw.toString('utf8'));
+        //console.log(JSON.stringify(openaiReq, null, 2));
       } catch {
         openaiError(res, 400, 'Invalid JSON in request body');
         return done(400);
@@ -134,7 +135,7 @@ export function createServer(credPool) {
           // Convert inside the rotation callback so workingDir/x-project-slug
           // always match the credential that actually serves this request.
           const ccBody = openaiToCommandCode(openaiReq, session);
-          console.log(JSON.stringify(ccBody, null, 2));
+          //console.log(JSON.stringify(ccBody, null, 2));
           const headers = buildGenerateHeaders(token, session.sessionId, ccBody.threadId);
           usedToken = token;
           usedSession = session;
