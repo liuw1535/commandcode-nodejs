@@ -60,7 +60,9 @@ export class CredentialPool {
     return this.creds.filter(c => !c.disabled && c.enabled).length;
   }
 
-  // Get next active credential (round-robin), or null if all disabled.
+  // Get next active credential (round-robin). Returns null only when all
+  // credentials are disabled; the activeCount() guard below ensures the
+  // loop always finds a match, so the trailing return is unreachable.
   next() {
     if (this.activeCount() === 0) return null;
     const n = this.creds.length;
@@ -72,7 +74,6 @@ export class CredentialPool {
         return c;
       }
     }
-    return null;
   }
 
   // Find a credential by token to disable it.
@@ -100,7 +101,6 @@ export class CredentialPool {
   // fn(token) must return the fetch Response (or throw). Resolves with Response.
   async requestWithRotation(fn) {
     const total = this.creds.length;
-    const tried = new Set();
     let attempts = 0;
 
     // We allow trying each active credential once; 429 retries happen on the
@@ -113,7 +113,6 @@ export class CredentialPool {
         throw err;
       }
       attempts++;
-      tried.add(cred.token);
 
       let res;
       try {

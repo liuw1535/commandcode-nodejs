@@ -8,10 +8,10 @@ import { resolveModel } from './modelProvider.js';
 const { randomUUID } = crypto;
 
 // OpenAI-facing model name -> upstream model id.
-// Case-insensitive match against the cached upstream model list; unknown
-// names pass through verbatim (the upstream will reject if invalid).
+// resolveModel never returns a falsy value (empty -> default, miss ->
+// passthrough), so no fallback is needed here.
 export function mapModel(openaiModel) {
-  return resolveModel(openaiModel) || config.MODELS.defaultModel;
+  return resolveModel(openaiModel);
 }
 
 function today() {
@@ -275,7 +275,6 @@ export function commandCodeEventsToOpenAI(events, openaiModel) {
       index: 0,
       message,
       finish_reason: finishReason,
-      ...(usageOut ? {} : {}),
     }],
   };
   if (usageOut) resp.usage = usageOut;
