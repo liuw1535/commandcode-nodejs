@@ -47,6 +47,7 @@ const DEFAULTS = {
   generation: { reasoningEffort: 'high', maxTokens: 64000 },
   retry: { '429': { max: 3, baseMs: 1000 } },
   credentialsFile: './credentials.json',
+  stateDir: './.state',
   projectSlug: '',
   warmup: {
     // Credential fingerprint warmup policy.
@@ -169,6 +170,7 @@ const COMMANDCODE_ENDPOINTS = cfg.commandcode.endpoints;
 // Project slug + credentials file
 const PROJECT_SLUG = str(env.PROJECT_SLUG, cfg.projectSlug);
 const CREDENTIALS_FILE = str(env.CREDENTIALS_FILE, cfg.credentialsFile);
+const STATE_DIR = str(env.STATE_DIR, cfg.stateDir);
 
 // Credential warmup policy (see config.json warmup.mode).
 const WARMUP_MODE = str(env.WARMUP_MODE, cfg.warmup.mode);
@@ -225,6 +227,9 @@ export const config = {
 
   // Credentials
   CREDENTIALS_FILE,
+
+  // Persisted state (per-credential fingerprint identity)
+  STATE_DIR,
 
   // Warmup policy
   WARMUP_MODE,

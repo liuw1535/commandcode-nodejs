@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import config from '../config.js';
 import log from '../logger.js';
 import { emitStartupSpans, emitWarmupApiSpans } from './telemetry.js';
+import sessionStore from './sessionStore.js';
 
 const { randomUUID } = crypto;
 
@@ -33,15 +34,12 @@ function randomSlugUser(len = 4 + Math.floor(Math.random() * 5)) {
 // Per-credential session state cache: token -> session object.
 const sessions = new Map();
 
-function makeSession() {
-  const sessionId = 'sess_' + randomHex(8);
+// Build a fresh machine identity (the persisted part of a session). Called only
+// when no persisted identity exists for this token yet.
+function makeMachineIdentity() {
   // Per-credential install id: each account looks like a separate CLI install
   // on a separate machine. A shared install id would correlate all accounts.
   const installId = randomUUID();
-  // Per-credential thread id: stays stable across a "conversation" the way the
-  // real CLI keeps one threadId / x-session-id for the session. Rotating it per
-  // request is a tell; pin it per credential instead.
-  const threadId = randomUUID();
 
   // Per-credential hardware profile, drawn from the machine pool so that N
   // accounts don't all report the identical CPU/RAM (a statistical outlier).
@@ -64,26 +62,59 @@ function makeSession() {
   };
   const thumbmark = sha256hex(components.macHashes[0] + components.osUserHash);
 
-  // Telemetry identity: per-credential node version + fake Windows pid, so OTel
-  // spans don't all carry the same pid/runtime across accounts.
+  // Telemetry identity: per-credential node version, so OTel spans don't all
+  // carry the same runtime across accounts.
   const nodeVersion = pick(config.NODE_VERSION_POOL);
-  const pid = 3000 + Math.floor(Math.random() * 12000);
 
   // Per-credential project slug: a random "c-users-<name>-desktop" per account
   // (matching what the real CLI derives from the working dir). Config can pin one.
   const projectSlug = config.PROJECT_SLUG || `c-users-${randomSlugUser()}-desktop`;
 
+  return { installId, components, thumbmark, nodeVersion, projectSlug, user: null };
+}
+
+// Assemble the full per-process session: machine identity (loaded from disk if
+// available, else freshly generated + persisted) plus per-launch ephemera
+// (sessionId / threadId / pid) that a real CLI regenerates every launch.
+function makeSession(token) {
+  // Per-launch: one session id + one conversation thread per process.
+  const sessionId = 'sess_' + randomHex(8);
+  // Per-credential thread id: stays stable across a "conversation" the way the
+  // real CLI keeps one threadId / x-session-id for the session. Rotating it per
+  // request is a tell; pin it per credential (per launch) instead.
+  const threadId = randomUUID();
+  // Per-launch Windows pid (regenerated each launch, like a real process).
+  const pid = 3000 + Math.floor(Math.random() * 12000);
+
+  let identity;
+  const stored = token ? sessionStore.load(token) : null;
+  if (stored) {
+    identity = stored;
+    // If config pins a slug, it wins over the persisted one.
+    if (config.PROJECT_SLUG) identity.projectSlug = config.PROJECT_SLUG;
+    log.info(`[fingerprint] reused persisted machine identity (thumbmark=${identity.thumbmark.slice(0, 8)}...)`);
+  } else {
+    identity = makeMachineIdentity();
+    if (token) sessionStore.save(token, identity);
+    log.info(`[fingerprint] generated new machine identity (thumbmark=${identity.thumbmark.slice(0, 8)}...)`);
+  }
+
   return {
-    sessionId, installId, threadId, components, thumbmark,
-    nodeVersion, pid, projectSlug,
-    user: null, warmed: false, warming: null,
+    sessionId, threadId, pid,
+    installId: identity.installId,
+    components: identity.components,
+    thumbmark: identity.thumbmark,
+    nodeVersion: identity.nodeVersion,
+    projectSlug: identity.projectSlug,
+    user: identity.user || null,
+    warmed: false, warming: null,
   };
 }
 
 function getSession(token) {
   let s = sessions.get(token);
   if (!s) {
-    s = makeSession();
+    s = makeSession(token);
     sessions.set(token, s);
   }
   return s;
@@ -138,6 +169,12 @@ export async function warmup(token, name) {
     if (who.ok) {
       const j = await who.json().catch(() => null);
       if (j?.user) s.user = j.user;
+      // Persist the resolved user identity alongside the machine fingerprint so
+      // it survives restarts (it's per-account, not per-launch).
+      if (s.user) sessionStore.save(token, {
+        installId: s.installId, components: s.components, thumbmark: s.thumbmark,
+        nodeVersion: s.nodeVersion, projectSlug: s.projectSlug, user: s.user,
+      });
       log.info(`[fingerprint] ${label} whoami ok user=${j?.user?.userName || j?.user?.id || 'unknown'}`);
     } else {
       log.warn(`[fingerprint] ${label} whoami status=${who.status}`);

@@ -33,6 +33,7 @@
     }
   },
   "credentialsFile": "./credentials.json",
+  "stateDir": "./.state",
   "projectSlug": "",
   "warmup": {
     "_comment": "Credential fingerprint warmup policy. mode: 'startup' = warm all enabled creds in background at boot (legacy default); 'lazy' = warm on first rotation, await before first /alpha/generate (first request on that token pays extra latency); 'lazy-async' = warm on first rotation in background, send generate immediately (non-blocking); 'off' = never warm up.",

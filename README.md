@@ -84,6 +84,7 @@ curl http://localhost:3000/v1/chat/completions \
 - **429**：同 token 指数退避重试（默认最多 3 次，`RETRY_429_BASE_MS=1000`）；仍失败则轮询到下一个 token，**不**禁用
 - **全部 token 被禁用**：返回 `503` OpenAI 格式错误
 - 指纹模拟（whoami / lifecycle-events / fingerprint/record / billing 探测）在启动后台执行，不阻塞服务
+- 每凭证的**硬件指纹（thumbmark / components / installId 等）持久化到 `STATE_DIR`**，重启后保持稳定，不再每次重启都换一台“机器”（避免上游关联/风控）；`sessionId / threadId / pid` 等每次启动重新生成，符合真实 CLI 行为
 
 ## 配置文件 (`config.json`)
 
@@ -112,6 +113,7 @@ curl http://localhost:3000/v1/chat/completions \
 | `AUTH_TOKEN` | （空=关闭） | 本地鉴权密钥（仅环境变量，不写入 config.json）；未设时启动告警但可访问 |
 | `MAX_BODY_BYTES` | `104857600` (100MB) | 请求体大小上限，超出返回 413 |
 | `CREDENTIALS_FILE` | `./credentials.json` | 凭证文件路径 |
+| `STATE_DIR` | `./.state` | 指纹持久化目录（每凭证硬件身份落盘，重启后保持稳定） |
 | `COMMANDCODE_BASE` | `https://api.commandcode.ai` | 上游地址 |
 | `COMMANDCODE_USER_AGENT` | `cli` | 模拟的 CLI `User-Agent` |
 | `CLI_VERSION` | `1.50.1` | 模拟的 CLI 版本号 |
@@ -139,6 +141,7 @@ config.js              配置加载器（环境变量 > config.json > 内置默�
 logger.js              终端日志（项目原有）
 src/
   fingerprint.js       指纹模拟（启动序列 + 请求头）
+  sessionStore.js      每凭证硬件指纹持久化（落盘/重启复用）
   telemetry.js         OTel 遥测上传（axiom + claicode）
   credPool.js          凭证池：加载/轮询/禁用/429/400
   modelProvider.js     上游模型列表拉取/缓存/定时刷新（/provider/v1/models）
