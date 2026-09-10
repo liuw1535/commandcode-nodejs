@@ -5,6 +5,8 @@ import log from '../logger.js';
 import { CredentialPool } from './credPool.js';
 import { openaiToCommandCode, commandCodeEventsToOpenAI } from './converter.js';
 import { pipeStream } from './streamMapper.js';
+import { responsesToCommandCode, commandCodeEventsToResponses } from './responsesConverter.js';
+import { pipeResponsesStream } from './responsesStreamMapper.js';
 import { getModels } from './modelProvider.js';
 import { sendGenerate, readAllEvents, emitTelemetry } from './upstream.js';
 
@@ -202,6 +204,113 @@ export function createServer(credPool) {
           return done(200);
         } catch (e) {
           log.error(`[nonstream] error: ${e?.message || e}`);
+          openaiError(res, 502, `failed to read upstream: ${e?.message || e}`);
+          return done(502);
+        }
+      }
+    }
+
+    // Responses API
+    if (method === 'POST' && path === '/v1/responses') {
+      let raw;
+      try {
+        raw = await readBody(req, config.MAX_BODY_BYTES);
+      } catch (e) {
+        if (e?.code === 'PAYLOAD_TOO_LARGE') {
+          openaiError(res, 413, 'Request body exceeds size limit', 'request_too_large', 'invalid_request_error');
+          return done(413);
+        }
+        openaiError(res, 400, `Failed to read body: ${e.message}`);
+        return done(400);
+      }
+
+      let responsesReq;
+      try {
+        responsesReq = JSON.parse(raw.toString('utf8'));
+      } catch {
+        openaiError(res, 400, 'Invalid JSON in request body');
+        return done(400);
+      }
+      // `input` is required (string or array); a missing model falls back to
+      // the default at converter time, but input is mandatory.
+      if (!responsesReq || (responsesReq.input == null)) {
+        openaiError(res, 400, 'Missing or invalid "input" field');
+        return done(400);
+      }
+
+      const stream = responsesReq.stream === true;
+      const openaiModel = responsesReq.model || config.MODELS.defaultModel;
+      const reqStartNs = BigInt(Date.now()) * 1000000n;
+
+      let upstreamRes, captured;
+      try {
+        const result = await sendGenerate(credPool, (session) => responsesToCommandCode(responsesReq, session));
+        upstreamRes = result.upstreamRes;
+        captured = result.captured;
+      } catch (e) {
+        const status = e.statusCode || 502;
+        openaiError(res, status, e.message || 'upstream error', null, 'invalid_request_error');
+        return done(status);
+      }
+
+      if (!upstreamRes.ok && upstreamRes.status >= 400) {
+        const text = await upstreamRes.text().catch(() => '');
+        openaiError(res, upstreamRes.status, `upstream error: ${text || upstreamRes.statusText}`);
+        return done(upstreamRes.status);
+      }
+
+      if (stream) {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache',
+          'connection': 'keep-alive',
+          'x-accel-buffering': 'no',
+        });
+        let pipeResult = null;
+        try {
+          pipeResult = await pipeResponsesStream({
+            res, upstream: upstreamRes, openaiModel, responsesReq,
+          });
+        } catch (e) {
+          log.error(`[responses stream] pipe error: ${e?.message || e}`);
+          try { res.write(`data: ${JSON.stringify({ type: 'error', message: 'stream error: ' + (e?.message || e) })}\n\n`); } catch { }
+        }
+        res.end();
+        if (captured && pipeResult) {
+          emitTelemetry(captured, {
+            inputTokens: pipeResult.inputTokens,
+            outputTokens: pipeResult.outputTokens,
+            cachedInputTokens: pipeResult.cachedInputTokens,
+            finishReasons: pipeResult.finishReasons,
+            ttftMs: pipeResult.ttftMs,
+          }, reqStartNs, BigInt(Date.now()) * 1000000n);
+        }
+        return done(200);
+      } else {
+        try {
+          const events = await readAllEvents(upstreamRes);
+          const resp = commandCodeEventsToResponses(events, openaiModel, responsesReq);
+          resp.model = openaiModel;
+          let nsInput = null, nsOutput = null, nsFinish = [];
+          let nsCached = null;
+          if (resp.usage) {
+            nsInput = resp.usage.input_tokens;
+            nsOutput = resp.usage.output_tokens;
+            if (resp.usage.input_tokens_details?.cached_tokens != null) nsCached = resp.usage.input_tokens_details.cached_tokens;
+          }
+          if (resp.status) nsFinish = [resp.status === 'incomplete' ? 'length' : 'stop'];
+          const body = JSON.stringify(resp);
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(body);
+          emitTelemetry(captured, {
+            inputTokens: nsInput,
+            outputTokens: nsOutput,
+            finishReasons: nsFinish,
+            cachedInputTokens: nsCached,
+          }, reqStartNs, BigInt(Date.now()) * 1000000n);
+          return done(200);
+        } catch (e) {
+          log.error(`[responses nonstream] error: ${e?.message || e}`);
           openaiError(res, 502, `failed to read upstream: ${e?.message || e}`);
           return done(502);
         }

@@ -37,6 +37,7 @@ npm start
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/v1/chat/completions` | OpenAI Chat Completions（支持 `stream: true/false`、`tools`、`tool_calls`、`reasoning_content`） |
+| POST | `/v1/responses` | OpenAI Responses API（`input`/`instructions`/`output` Items、`reasoning`、流式语义事件） |
 | GET  | `/v1/models` | 返回可用模型列表 |
 | GET  | `/health` | 健康检查，返回可用凭证数 |
 | GET  | `/v1/credentials/status` | 各凭证 disabled 状态（需鉴权） |
@@ -50,6 +51,33 @@ curl http://localhost:3000/v1/chat/completions \
   -d '{
     "model": "glm-5.2",
     "messages": [{"role":"user","content":"你是谁？"}],
+    "stream": true
+  }'
+```
+
+### `/v1/responses` 示例
+
+```bash
+# 非流式
+curl http://localhost:3000/v1/responses \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zai-org/GLM-5.2",
+    "instructions": "Be concise.",
+    "input": "数到3",
+    "reasoning": { "effort": "high" },
+    "stream": false
+  }'
+
+# 流式（语义事件：response.created / response.output_text.delta /
+#   response.reasoning_summary_text.delta / response.completed ...）
+curl -N http://localhost:3000/v1/responses \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zai-org/GLM-5.2",
+    "input": [{"role":"user","content":"你好"}],
     "stream": true
   }'
 ```
@@ -146,19 +174,28 @@ src/
   credPool.js          凭证池：加载/轮询/禁用/429/400
   modelProvider.js     上游模型列表拉取/缓存/定时刷新（/provider/v1/models）
   converter.js         OpenAI Chat ↔ Command Code 格式转换（含工具）
+  responsesConverter.js OpenAI Responses ↔ Command Code 格式转换（input/instructions/output Items）
   ccBody.js            Command Code /alpha/generate body 通用装配（API 风格无关）
   upstream.js          上游请求生命周期：轮询 + 指纹 + fetch + 遥测（API 风格无关）
   streamMapper.js       Command Code SSE → OpenAI Chat SSE 转换
+  responsesStreamMapper.js Command Code SSE → OpenAI Responses 语义事件转换
   openaiServer.js      HTTP 服务器 + 路由 + 鉴权 + 体积限制
 index.js              入口
 ```
 
 ## 工具调用
 
-完整支持 OpenAI function calling 双向转换：
+完整支持 OpenAI function calling 双向转换（`/v1/chat/completions` 与 `/v1/responses` 两条路由均支持）：
 - 请求侧：`tools[].function` → commandcode `{name, description, input_schema}`；assistant `tool_calls` 与 `tool` 角色结果消息正确还原为 commandcode 的 `tool-call` / `tool-result` 块
 - 响应侧：上游 `tool-call` 事件 → OpenAI `tool_calls`，流式下 `arguments` 原样透传上游拼接的 JSON 字符串
 - 推理内容映射为 OpenAI 扩展字段 `reasoning_content`（非推理模型该字段缺省）
+
+### `/v1/responses` 的差异
+
+Responses API 用类型化的 `input` / `output` Items 而非 `messages`，转换器同样双向覆盖：
+- 请求侧：`input`（字符串或 Item 数组）+ `instructions` → commandcode `messages` + `system`；`function_call` / `function_call_output` / `reasoning` Item 还原为 `tool-call` / `tool-result` / `reasoning` 块；`reasoning.effort` → `reasoning_effort`，`max_output_tokens` → `max_tokens`
+- 响应侧（非流式）：聚合为 `{object:"response", output:[...], usage}`，`output` 含 `reasoning` / `message` / `function_call` Items；`finish_reason` 为 `length` 时 `status` 置为 `incomplete`
+- 流式：上游 SSE → Responses 语义事件序列（`response.created` → `output_item.added` → `output_text.delta` / `reasoning_summary_text.delta` / `function_call_arguments.delta` → `output_item.done` → `response.completed`）
 
 ## 运行要求
 
