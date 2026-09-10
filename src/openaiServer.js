@@ -4,10 +4,9 @@ import config from '../config.js';
 import log from '../logger.js';
 import { CredentialPool } from './credPool.js';
 import { openaiToCommandCode, commandCodeEventsToOpenAI } from './converter.js';
-import { buildGenerateHeaders, getSessionForToken, ensureWarmed } from './fingerprint.js';
-import { emitApiSpan } from './telemetry.js';
 import { pipeStream } from './streamMapper.js';
 import { getModels } from './modelProvider.js';
+import { sendGenerate, readAllEvents, emitTelemetry } from './upstream.js';
 
 // OpenAI-shaped error JSON.
 function openaiError(res, status, message, code, type) {
@@ -122,36 +121,17 @@ export function createServer(credPool) {
       const stream = openaiReq.stream === true;
       const includeUsage = !!(openaiReq.stream_options && openaiReq.stream_options.include_usage);
       const openaiModel = openaiReq.model || config.MODELS.defaultModel;
-
-      // Captured inside the rotation callback so telemetry can mirror the
-      // credential that actually served the request.
-      let usedToken = null, usedSession = null, usedThreadId = null, usedModel = null;
-      let usedTrace = null, usedToolCount = 0, usedHadToolCalls = false;
       const reqStartNs = BigInt(Date.now()) * 1000000n;
 
-      let upstreamRes;
+      // sendGenerate runs the OpenAI->commandcode conversion inside the
+      // rotation callback so workingDir/x-project-slug always match the
+      // credential that actually serves this request. Future API styles pass
+      // their own buildBody here.
+      let upstreamRes, captured;
       try {
-        upstreamRes = await credPool.requestWithRotation(async (token) => {
-          const cred = credPool.find(token);
-          await ensureWarmed(token, cred?.name, config.WARMUP_MODE);
-          const session = getSessionForToken(token);
-          // Convert inside the rotation callback so workingDir/x-project-slug
-          // always match the credential that actually serves this request.
-          const ccBody = openaiToCommandCode(openaiReq, session);
-          //console.log(JSON.stringify(ccBody, null, 2));
-          const headers = buildGenerateHeaders(token, session.sessionId, ccBody.threadId);
-          usedToken = token;
-          usedSession = session;
-          usedThreadId = ccBody.threadId;
-          usedModel = ccBody.params.model;
-          usedTrace = headers._trace; delete headers._trace;
-          usedToolCount = Array.isArray(ccBody.params.tools) ? ccBody.params.tools.length : 0;
-          return fetch(config.COMMANDCODE_BASE + config.COMMANDCODE_ENDPOINTS.generate, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(ccBody),
-          });
-        });
+        const result = await sendGenerate(credPool, (session) => openaiToCommandCode(openaiReq, session));
+        upstreamRes = result.upstreamRes;
+        captured = result.captured;
       } catch (e) {
         const status = e.statusCode || 502;
         openaiError(res, status, e.message || 'upstream error', null, 'invalid_request_error');
@@ -185,25 +165,14 @@ export function createServer(credPool) {
         res.end();
         // Emit OTel telemetry span mirroring the served credential.
         // Silent on success, warns only on failure (see telemetry.js).
-        if (usedToken && pipeResult) {
-          usedHadToolCalls = pipeResult.finishReasons?.some(r => r === 'tool_calls');
-          emitApiSpan({
-            session: usedSession,
-            threadId: usedThreadId,
-            model: usedModel,
+        if (captured && pipeResult) {
+          emitTelemetry(captured, {
             inputTokens: pipeResult.inputTokens,
             outputTokens: pipeResult.outputTokens,
             cachedInputTokens: pipeResult.cachedInputTokens,
             finishReasons: pipeResult.finishReasons,
             ttftMs: pipeResult.ttftMs,
-            toolCount: usedToolCount,
-            hadToolCalls: usedHadToolCalls,
-            startNs: reqStartNs,
-            endNs: BigInt(Date.now()) * 1000000n,
-            traceId: usedTrace?.traceId,
-            chatSpanId: usedTrace?.spanId,
-            user: usedSession?.user,
-          }).catch(() => { });
+          }, reqStartNs, BigInt(Date.now()) * 1000000n);
         }
         return done(200);
       } else {
@@ -224,24 +193,12 @@ export function createServer(credPool) {
           const body = JSON.stringify(resp);
           res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
           res.end(body);
-          if (usedToken) {
-            emitApiSpan({
-              session: usedSession,
-              threadId: usedThreadId,
-              model: usedModel,
-              inputTokens: nsInput,
-              outputTokens: nsOutput,
-              finishReasons: nsFinish,
-              cachedInputTokens: nsCached,
-              toolCount: usedToolCount,
-              hadToolCalls: nsFinish.some(r => r === 'tool_calls'),
-              startNs: reqStartNs,
-              endNs: BigInt(Date.now()) * 1000000n,
-              traceId: usedTrace?.traceId,
-              chatSpanId: usedTrace?.spanId,
-              user: usedSession?.user,
-            }).catch(() => { });
-          }
+          emitTelemetry(captured, {
+            inputTokens: nsInput,
+            outputTokens: nsOutput,
+            finishReasons: nsFinish,
+            cachedInputTokens: nsCached,
+          }, reqStartNs, BigInt(Date.now()) * 1000000n);
           return done(200);
         } catch (e) {
           log.error(`[nonstream] error: ${e?.message || e}`);
@@ -256,25 +213,4 @@ export function createServer(credPool) {
     return done(404);
   });
   return server;
-}
-
-// Read all line-delimited JSON events from an upstream fetch Response.
-async function readAllEvents(upstream) {
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let buffer = '';
-  const events = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let nl;
-    while ((nl = buffer.indexOf('\n')) !== -1) {
-      let line = buffer.slice(0, nl).replace(/\r$/, '').trim();
-      buffer = buffer.slice(nl + 1);
-      if (!line || !line.startsWith('{')) continue;
-      try { events.push(JSON.parse(line)); } catch { }
-    }
-  }
-  return events;
 }

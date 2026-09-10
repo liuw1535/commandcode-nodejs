@@ -145,8 +145,10 @@ src/
   telemetry.js         OTel 遥测上传（axiom + claicode）
   credPool.js          凭证池：加载/轮询/禁用/429/400
   modelProvider.js     上游模型列表拉取/缓存/定时刷新（/provider/v1/models）
-  converter.js         OpenAI ↔ Command Code 格式转换（含工具）
-  streamMapper.js       Command Code SSE → OpenAI SSE 转换
+  converter.js         OpenAI Chat ↔ Command Code 格式转换（含工具）
+  ccBody.js            Command Code /alpha/generate body 通用装配（API 风格无关）
+  upstream.js          上游请求生命周期：轮询 + 指纹 + fetch + 遥测（API 风格无关）
+  streamMapper.js       Command Code SSE → OpenAI Chat SSE 转换
   openaiServer.js      HTTP 服务器 + 路由 + 鉴权 + 体积限制
 index.js              入口
 ```

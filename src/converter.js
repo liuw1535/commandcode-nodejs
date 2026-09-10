@@ -2,8 +2,8 @@
 // Handles messages, system prompts, tools, tool_calls, and reasoning blocks.
 import crypto from 'node:crypto';
 import config from '../config.js';
-import { getSessionForToken } from './fingerprint.js';
 import { resolveModel } from './modelProvider.js';
+import { assembleCcBody } from './ccBody.js';
 
 const { randomUUID } = crypto;
 
@@ -12,10 +12,6 @@ const { randomUUID } = crypto;
 // passthrough), so no fallback is needed here.
 export function mapModel(openaiModel) {
   return resolveModel(openaiModel);
-}
-
-function today() {
-  return new Date().toISOString().slice(0, 10);
 }
 
 // Convert an OpenAI message's content to commandcode content blocks array.
@@ -71,7 +67,6 @@ function toCcTools(openaiTools) {
 // session (optional): per-credential session carrying the fake machine identity;
 // used to derive workingDir so it matches the x-project-slug header.
 export function openaiToCommandCode(openaiReq, session) {
-  const projectSlug = session?.projectSlug || config.PROJECT_SLUG || 'c-users-proxy-desktop';
   const messages = Array.isArray(openaiReq.messages) ? openaiReq.messages : [];
 
   // Extract the leading contiguous run of system messages into commandcode's
@@ -177,38 +172,19 @@ export function openaiToCommandCode(openaiReq, session) {
   const threadId = openaiReq.threadId || session?.threadId || randomUUID();
   const tools = toCcTools(openaiReq.tools);
 
-  const params = {
+  // The Chat-Completions-specific part ends here: ccMessages / system / tools
+  // are commandcode-native primitives. assembleCcBody builds the shared outer
+  // body + config block + params tail (reused by every API style).
+  return assembleCcBody({
+    ccMessages,
+    system,
+    tools,
     model: mapModel(openaiReq.model),
-    messages: ccMessages,
-    max_tokens: openaiReq.max_tokens ?? config.MAX_TOKENS,
-    stream: true, // always stream upstream; we aggregate if client wants non-stream
-    reasoning_effort: openaiReq.reasoning_effort || config.REASONING_EFFORT,
-  };
-  if (tools) params.tools = tools;
-  if (system) params.system = system;
-
-  // Derive workingDir from the per-credential slug: "c-users-foo42-desktop"
-  // -> "C:\Users\foo42\Desktop" (matches what the real CLI reports).
-  const userPart = projectSlug.replace(/^c-users-/, '').replace(/-desktop$/, '') || 'proxy';
-  return {
-    config: {
-      workingDir: `C:\\Users\\${userPart}\\Desktop`,
-      date: today(),
-      environment: session?.components?.platform || config.FINGERPRINT.platform,
-      structure: [],
-      isGitRepo: false,
-      currentBranch: '',
-      mainBranch: '',
-      gitStatus: '',
-      recentCommits: [],
-    },
-    memory: null,
-    taste: null,
-    skills: null,
-    permissionMode: 'standard',
+    maxTokens: openaiReq.max_tokens,
+    reasoningEffort: openaiReq.reasoning_effort,
     threadId,
-    params,
-  };
+    session,
+  });
 }
 
 // Aggregate commandcode SSE events into a non-streaming OpenAI response.
