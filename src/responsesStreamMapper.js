@@ -71,13 +71,20 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
   const msgState = { open: false, id: null, outputIndex: 0, contentIndex: 0 };
   const toolState = new Map(); // callId -> {open, id, outputIndex, name, args, input}
 
-  // Build the base Response object (without output) reused for created/completed.
-  const baseResponse = () => ({
-    id: respId,
-    object: 'response',
-    created_at: createdAt,
-    model: openaiModel || config.MODELS.defaultModel,
-  });
+  // Build the base Response object reused for created/in_progress/completed.
+  // created/in_progress carry status:"in_progress" + an empty output array so
+  // strict clients reading event.response.status don't see undefined.
+  const baseResponse = (status = 'in_progress') => {
+    const r = {
+      id: respId,
+      object: 'response',
+      created_at: createdAt,
+      model: openaiModel || config.MODELS.defaultModel,
+      status,
+    };
+    if (status === 'in_progress') r.output = [];
+    return r;
+  };
 
   const maybeTtft = () => { if (ttftMs === null) ttftMs = Date.now() - startMs; };
 
@@ -407,8 +414,7 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
     });
   }
 
-  const completed = baseResponse();
-  completed.status = status;
+  const completed = baseResponse(status);
   completed.output = output;
   if (status === 'incomplete') completed.incomplete_details = { reason: 'max_output_tokens' };
   if (responsesReq?.reasoning?.effort) completed.reasoning = { effort: responsesReq.reasoning.effort };

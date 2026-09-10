@@ -238,10 +238,16 @@ function inputToCcMessages(responsesReq) {
 export function responsesToCommandCode(responsesReq, session) {
   const { ccMessages, system } = inputToCcMessages(responsesReq);
 
-  // reasoning: {effort} -> reasoning_effort (string). Tolerate a bare string too.
+  // reasoning: {effort} -> reasoning_effort (string). Only `effort` (low/medium/
+  // high) maps; `summary` (auto/concise/detailed) is a different dimension and
+  // must not be passed through as the effort. Tolerate a bare string too.
   let reasoningEffort = config.REASONING_EFFORT;
   if (responsesReq.reasoning) {
-    reasoningEffort = responsesReq.reasoning.effort || responsesReq.reasoning.summary || reasoningEffort;
+    if (typeof responsesReq.reasoning.effort === 'string') {
+      reasoningEffort = responsesReq.reasoning.effort;
+    } else if (typeof responsesReq.reasoning === 'string') {
+      reasoningEffort = responsesReq.reasoning;
+    }
   }
 
   const threadId = responsesReq.threadId || session?.threadId || randomUUID();
