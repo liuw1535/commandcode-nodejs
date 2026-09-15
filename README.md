@@ -195,7 +195,11 @@ index.js              入口
 Responses API 用类型化的 `input` / `output` Items 而非 `messages`，转换器同样双向覆盖：
 - 请求侧：`input`（字符串或 Item 数组）+ `instructions` → commandcode `messages` + `system`；`function_call` / `function_call_output` / `reasoning` Item 还原为 `tool-call` / `tool-result` / `reasoning` 块；`reasoning.effort` → `reasoning_effort`，`max_output_tokens` → `max_tokens`
 - 响应侧（非流式）：聚合为 `{object:"response", output:[...], usage}`，`output` 含 `reasoning` / `message` / `function_call` Items；`finish_reason` 为 `length` 时 `status` 置为 `incomplete`
-- 流式：上游 SSE → Responses 语义事件序列（`response.created` → `output_item.added` → `output_text.delta` / `reasoning_summary_text.delta` / `function_call_arguments.delta` → `output_item.done` → `response.completed`）
+- 流式：上游 SSE → Responses 语义事件序列（`response.created` → `output_item.added` → `output_text.delta` / `reasoning_summary_text.delta` / `function_call_arguments.delta` → `output_item.done` → `response.completed`），每个事件携带递增的 `sequence_number`；多步流程（推理 → 工具 → 再推理 → 回答）中每段 reasoning/text 各自成独立 Item，不合并累积文本
+
+无状态与工具限制：
+- **`previous_response_id` 不支持**：代理无响应存储，请求携带该字段直接返回 `400`（`previous_response_id_not_supported`），避免静默丢失历史；`store` 也无效果，客户端应全量重发 `input`（即 Codex CLI 的 `store: false` 模式，不受影响）
+- **内置工具默认丢弃**：`web_search` / `file_search` / `local_shell` / `mcp` / `custom` 等非 `function` 类型工具不会进入转换后的工具数组（上游不支持，丢弃时打 warn 日志）；Codex 自带的 shell 等自定义 function 工具正常转换
 
 ## 运行要求
 

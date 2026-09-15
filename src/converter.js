@@ -3,7 +3,7 @@
 import crypto from 'node:crypto';
 import config from '../config.js';
 import { resolveModel } from './modelProvider.js';
-import { assembleCcBody } from './ccBody.js';
+import { assembleCcBody, debugCcBodyReasoning } from './ccBody.js';
 
 const { randomUUID } = crypto;
 
@@ -175,7 +175,7 @@ export function openaiToCommandCode(openaiReq, session) {
   // The Chat-Completions-specific part ends here: ccMessages / system / tools
   // are commandcode-native primitives. assembleCcBody builds the shared outer
   // body + config block + params tail (reused by every API style).
-  return assembleCcBody({
+  const ccBody = assembleCcBody({
     ccMessages,
     system,
     tools,
@@ -185,6 +185,8 @@ export function openaiToCommandCode(openaiReq, session) {
     threadId,
     session,
   });
+  debugCcBodyReasoning(ccBody, { reasoningEffort: openaiReq.reasoning_effort });
+  return ccBody;
 }
 
 // Aggregate commandcode SSE events into a non-streaming OpenAI response.

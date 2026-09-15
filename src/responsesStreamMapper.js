@@ -22,9 +22,18 @@
 //     response.output_item.done
 //   response.completed
 //
+// Every event carries a monotonically increasing `sequence_number`, matching
+// the official stream contract (clients use it for ordering/gap detection).
+//
 // Command Code gives no explicit per-item "end" signal, so we close an open
 // item lazily when the stream moves to a different item type, on `finish-step`,
 // and finally on `finish` (which also drives response.completed).
+//
+// Text buffers are PER ITEM (rsState.text / msgState.text, reset when the item
+// opens): in a multi-step flow (reasoning -> tool call -> reasoning -> answer)
+// the upstream interleaves several reasoning/text segments, and each item's
+// .done events / completed output entry must carry only that segment's text,
+// not the cumulative stream text.
 import crypto from 'node:crypto';
 import config from '../config.js';
 
@@ -34,10 +43,7 @@ function shortId(prefix, n = 24) {
   return prefix + randomUUID().replace(/-/g, '').slice(0, n);
 }
 
-function sseData(res, obj) {
-  res.write(`data: ${JSON.stringify(obj)}\n\n`);
-}
-
+// Map commandcode finishReason -> Responses status.
 function mapFinishToStatus(fr) {
   if (fr === 'length' || fr === 'max-tokens') return 'incomplete';
   return 'completed';
@@ -55,20 +61,32 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
   const startMs = Date.now();
   let ttftMs = null;
 
+  // sequence_number: monotonically increasing per-event counter, attached to
+  // every emitted event (official Responses stream contract).
+  let seq = 0;
+  const sseData = (obj) => {
+    obj.sequence_number = seq++;
+    res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  };
+
   // Accumulators for the final response.completed payload + telemetry.
-  let textBuf = '';
-  let reasoningBuf = '';
-  const toolCalls = []; // {id, callId, name, args, input}
   let finishReason = 'stop';
   let lastUsage = null;
 
   // output_index counter shared across all items (reasoning/message/function).
   let nextOutputIndex = 0;
 
+  // Completed output items keyed by their output_index (assigned at open).
+  // Building the final `output` array from this keeps both the per-item ids
+  // and the item order consistent with what was already streamed via
+  // output_item.added / output_item.done.
+  const itemByIndex = [];
+
   // Per-item open state. Only one reasoning item and one message item are
-  // open at a time; function calls are keyed by toolCallId.
-  const rsState = { open: false, id: null, outputIndex: 0, summaryIndex: 0 };
-  const msgState = { open: false, id: null, outputIndex: 0, contentIndex: 0 };
+  // open at a time; function calls are keyed by toolCallId. `text` is the
+  // item-local buffer (reset on open).
+  const rsState = { open: false, id: null, outputIndex: 0, summaryIndex: 0, text: '' };
+  const msgState = { open: false, id: null, outputIndex: 0, contentIndex: 0, text: '' };
   const toolState = new Map(); // callId -> {open, id, outputIndex, name, args, input}
 
   // Build the base Response object reused for created/in_progress/completed.
@@ -96,12 +114,13 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
     rsState.id = shortId('rs_');
     rsState.outputIndex = nextOutputIndex++;
     rsState.summaryIndex = 0;
-    sseData(res, {
+    rsState.text = ''; // per-item buffer: only this segment's reasoning
+    sseData({
       type: 'response.output_item.added',
       output_index: rsState.outputIndex,
       item: { type: 'reasoning', id: rsState.id, summary: [] },
     });
-    sseData(res, {
+    sseData({
       type: 'response.reasoning_summary_part.added',
       item_id: rsState.id,
       output_index: rsState.outputIndex,
@@ -113,25 +132,31 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
   function closeReasoning() {
     if (!rsState.open) return;
     rsState.open = false;
-    sseData(res, {
+    sseData({
       type: 'response.reasoning_summary_text.done',
       item_id: rsState.id,
       output_index: rsState.outputIndex,
       summary_index: rsState.summaryIndex,
-      text: reasoningBuf,
+      text: rsState.text,
     });
-    sseData(res, {
+    sseData({
       type: 'response.reasoning_summary_part.done',
       item_id: rsState.id,
       output_index: rsState.outputIndex,
       summary_index: rsState.summaryIndex,
-      part: { type: 'summary_text', text: reasoningBuf },
+      part: { type: 'summary_text', text: rsState.text },
     });
-    sseData(res, {
+    const item = {
+      type: 'reasoning',
+      id: rsState.id,
+      summary: [{ type: 'summary_text', text: rsState.text }],
+    };
+    sseData({
       type: 'response.output_item.done',
       output_index: rsState.outputIndex,
-      item: { type: 'reasoning', id: rsState.id, summary: [{ type: 'summary_text', text: reasoningBuf }] },
+      item,
     });
+    itemByIndex[rsState.outputIndex] = item;
   }
 
   function openMessage() {
@@ -140,7 +165,8 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
     msgState.id = shortId('msg_');
     msgState.outputIndex = nextOutputIndex++;
     msgState.contentIndex = 0;
-    sseData(res, {
+    msgState.text = ''; // per-item buffer: only this segment's text
+    sseData({
       type: 'response.output_item.added',
       output_index: msgState.outputIndex,
       item: {
@@ -151,7 +177,7 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
         content: [],
       },
     });
-    sseData(res, {
+    sseData({
       type: 'response.content_part.added',
       item_id: msgState.id,
       output_index: msgState.outputIndex,
@@ -163,31 +189,33 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
   function closeMessage() {
     if (!msgState.open) return;
     msgState.open = false;
-    sseData(res, {
+    sseData({
       type: 'response.output_text.done',
       item_id: msgState.id,
       output_index: msgState.outputIndex,
       content_index: msgState.contentIndex,
-      text: textBuf,
+      text: msgState.text,
     });
-    sseData(res, {
+    sseData({
       type: 'response.content_part.done',
       item_id: msgState.id,
       output_index: msgState.outputIndex,
       content_index: msgState.contentIndex,
-      part: { type: 'output_text', text: textBuf, annotations: [] },
+      part: { type: 'output_text', text: msgState.text, annotations: [] },
     });
-    sseData(res, {
+    const item = {
+      type: 'message',
+      id: msgState.id,
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'output_text', text: msgState.text, annotations: [] }],
+    };
+    sseData({
       type: 'response.output_item.done',
       output_index: msgState.outputIndex,
-      item: {
-        type: 'message',
-        id: msgState.id,
-        role: 'assistant',
-        status: 'completed',
-        content: [{ type: 'output_text', text: textBuf, annotations: [] }],
-      },
+      item,
     });
+    itemByIndex[msgState.outputIndex] = item;
   }
 
   function getTool(callId, name) {
@@ -214,7 +242,7 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
     const t = getTool(callId, name);
     if (t.open) return t;
     t.open = true;
-    sseData(res, {
+    sseData({
       type: 'response.output_item.added',
       output_index: t.outputIndex,
       item: {
@@ -232,23 +260,25 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
     if (!t.open) return;
     t.open = false;
     const args = (t.input != null) ? JSON.stringify(t.input) : (t.args || '');
-    sseData(res, {
+    sseData({
       type: 'response.function_call_arguments.done',
       item_id: t.id,
       output_index: t.outputIndex,
       arguments: args,
     });
-    sseData(res, {
+    const item = {
+      type: 'function_call',
+      id: t.id,
+      call_id: t.callId,
+      name: t.name,
+      arguments: args,
+    };
+    sseData({
       type: 'response.output_item.done',
       output_index: t.outputIndex,
-      item: {
-        type: 'function_call',
-        id: t.id,
-        call_id: t.callId,
-        name: t.name,
-        arguments: args,
-      },
+      item,
     });
+    itemByIndex[t.outputIndex] = item;
   }
 
   // Close every currently-open item (used at finish-step / finish).
@@ -259,8 +289,8 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
   }
 
   // --- emit the opening lifecycle ---
-  sseData(res, { type: 'response.created', response: baseResponse() });
-  sseData(res, { type: 'response.in_progress', response: baseResponse() });
+  sseData({ type: 'response.created', response: baseResponse() });
+  sseData({ type: 'response.in_progress', response: baseResponse() });
 
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder('utf-8');
@@ -288,8 +318,8 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
             openReasoning();
             const delta = ev.text || '';
             if (delta) {
-              reasoningBuf += delta;
-              sseData(res, {
+              rsState.text += delta;
+              sseData({
                 type: 'response.reasoning_summary_text.delta',
                 item_id: rsState.id,
                 output_index: rsState.outputIndex,
@@ -305,8 +335,8 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
             openMessage();
             const delta = ev.text || '';
             if (delta) {
-              textBuf += delta;
-              sseData(res, {
+              msgState.text += delta;
+              sseData({
                 type: 'response.output_text.delta',
                 item_id: msgState.id,
                 output_index: msgState.outputIndex,
@@ -327,7 +357,7 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
             const t = toolState.get(ev.id || ev.toolCallId);
             if (t && ev.delta) t.args += ev.delta;
             if (t) {
-              sseData(res, {
+              sseData({
                 type: 'response.function_call_arguments.delta',
                 item_id: t.id,
                 output_index: t.outputIndex,
@@ -344,17 +374,8 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
             maybeTtft();
             if (rsState.open) closeReasoning();
             if (msgState.open) closeMessage();
-            const callId = ev.toolCallId || ev.id;
-            const t = openTool(callId, ev.toolName);
+            const t = openTool(ev.toolCallId || ev.id, ev.toolName);
             if (ev.input != null) t.input = ev.input;
-            // Record for the final response payload.
-            toolCalls.push({
-              id: t.id,
-              callId: t.callId,
-              name: t.name || ev.toolName || '',
-              input: ev.input,
-              args: t.args,
-            });
             closeTool(t);
             break;
           }
@@ -387,30 +408,17 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
   // --- assemble and emit response.completed ---
   const status = mapFinishToStatus(finishReason);
 
-  const output = [];
-  if (reasoningBuf) {
-    output.push({
-      type: 'reasoning',
-      id: shortId('rs_'),
-      summary: [{ type: 'summary_text', text: reasoningBuf }],
-    });
-  }
-  if (textBuf || toolCalls.length === 0) {
+  // Items in output_index order, same ids as streamed via output_item.done.
+  const output = itemByIndex.filter(Boolean);
+  // A plain text answer with no text/tools still yields an (empty) message
+  // item — matching the real Responses API behavior.
+  if (!output.some(i => i.type === 'message') && !output.some(i => i.type === 'function_call')) {
     output.push({
       type: 'message',
       id: shortId('msg_'),
       role: 'assistant',
       status: 'completed',
-      content: [{ type: 'output_text', text: textBuf, annotations: [] }],
-    });
-  }
-  for (const tc of toolCalls) {
-    output.push({
-      type: 'function_call',
-      id: tc.id,
-      call_id: tc.callId,
-      name: tc.name,
-      arguments: tc.input != null ? JSON.stringify(tc.input) : (tc.args || ''),
+      content: [{ type: 'output_text', text: '', annotations: [] }],
     });
   }
 
@@ -429,7 +437,7 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
     }
   }
 
-  sseData(res, { type: 'response.completed', response: completed });
+  sseData({ type: 'response.completed', response: completed });
 
   // Surface captured usage/finish for telemetry (same shape pipeStream returns).
   return {

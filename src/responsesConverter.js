@@ -9,8 +9,9 @@
 // translation in and out differs.
 import crypto from 'node:crypto';
 import config from '../config.js';
+import log from '../logger.js';
 import { resolveModel } from './modelProvider.js';
-import { assembleCcBody } from './ccBody.js';
+import { assembleCcBody, debugCcBodyReasoning } from './ccBody.js';
 
 const { randomUUID } = crypto;
 
@@ -84,25 +85,30 @@ function contentPartsToCcBlocks(content) {
 // Convert Responses tools to commandcode tools.
 // Responses tool: {type:"function", name, description, parameters, strict}.
 // Also tolerate Chat-style {type:"function", function:{name,description,parameters}}.
+// Built-in tool types (web_search / file_search / local_shell / mcp /
+// custom / ...) are unsupported upstream and dropped by default (warn log);
+// passing them through would only produce upstream 400s.
 function toCcTools(responsesTools) {
   if (!Array.isArray(responsesTools)) return undefined;
   const out = [];
+  const dropped = [];
   for (const t of responsesTools) {
     if (!t) continue;
-    if (t.type === 'function' && t.function) {
-      const fn = t.function;
-      out.push({
-        name: fn.name,
-        description: fn.description || '',
-        input_schema: fn.parameters || fn.input_schema || { type: 'object', properties: {} },
-      });
-    } else if (t.name || (t.type === 'function' && t.type)) {
-      out.push({
-        name: t.name,
-        description: t.description || '',
-        input_schema: t.parameters || t.input_schema || { type: 'object', properties: {} },
-      });
+    if (t.type === 'function') {
+      const fn = t.function || t; // Chat-nested or Responses-flat
+      if (fn.name) {
+        out.push({
+          name: fn.name,
+          description: fn.description || '',
+          input_schema: fn.parameters || fn.input_schema || { type: 'object', properties: {} },
+        });
+        continue;
+      }
     }
+    dropped.push(t.type || 'unknown');
+  }
+  if (dropped.length) {
+    log.warn(`[responses] dropping unsupported non-function tool type(s): ${dropped.join(', ')} (built-in tools are not supported upstream)`);
   }
   return out.length ? out : undefined;
 }
@@ -253,7 +259,7 @@ export function responsesToCommandCode(responsesReq, session) {
   const threadId = responsesReq.threadId || session?.threadId || randomUUID();
   const tools = toCcTools(responsesReq.tools);
 
-  return assembleCcBody({
+  const ccBody = assembleCcBody({
     ccMessages,
     system,
     tools,
@@ -263,6 +269,9 @@ export function responsesToCommandCode(responsesReq, session) {
     threadId,
     session,
   });
+
+  debugCcBodyReasoning(ccBody, { reasoningEffort });
+  return ccBody;
 }
 
 // --- response side: commandcode events -> Responses object (non-streaming) ---
@@ -270,26 +279,64 @@ export function responsesToCommandCode(responsesReq, session) {
 // Aggregate commandcode SSE events into a non-streaming OpenAI Responses
 // object. events: array of parsed JSON event objects (same shape readAllEvents
 // returns). responsesReq is the original request (used for reasoning effort).
+//
+// Reasoning/text arrive as interleaved segments in multi-step flows (reasoning
+// -> tool call -> reasoning -> answer), so items are segmented on every kind
+// switch: each contiguous run of reasoning/text deltas becomes its own
+// reasoning/message item, in event order, instead of being merged into one
+// cumulative blob.
 export function commandCodeEventsToResponses(events, openaiModel, responsesReq) {
-  let text = '';
-  let reasoning = '';
-  const toolCalls = []; // {id, callId, name, input}
+  const items = []; // output items, in event order
   let finishReason = 'stop';
   let usage = null;
 
+  // Current open reasoning/text segment: {kind: 'reasoning'|'text', text}.
+  let seg = null;
+  const closeSeg = () => {
+    if (!seg) return;
+    if (seg.kind === 'reasoning') {
+      if (seg.text) {
+        items.push({
+          type: 'reasoning',
+          id: shortId('rs_'),
+          summary: [{ type: 'summary_text', text: seg.text }],
+        });
+      }
+    } else {
+      items.push({
+        type: 'message',
+        id: shortId('msg_'),
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: seg.text, annotations: [] }],
+      });
+    }
+    seg = null;
+  };
+
   for (const ev of events) {
     switch (ev.type) {
-      case 'text-delta': text += ev.text || ''; break;
-      case 'reasoning-delta': reasoning += ev.text || ''; break;
+      case 'text-delta':
+        if (seg?.kind !== 'text') { closeSeg(); seg = { kind: 'text', text: '' }; }
+        seg.text += ev.text || '';
+        break;
+      case 'reasoning-delta':
+        if (seg?.kind !== 'reasoning') { closeSeg(); seg = { kind: 'reasoning', text: '' }; }
+        seg.text += ev.text || '';
+        break;
       case 'tool-call':
-        toolCalls.push({
-          callId: ev.toolCallId,
-          name: ev.toolName,
-          input: ev.input,
+        closeSeg();
+        items.push({
+          type: 'function_call',
+          id: shortId('fc_'),
+          call_id: ev.toolCallId || shortId('call_'),
+          name: ev.toolName || '',
+          arguments: JSON.stringify(ev.input ?? {}),
         });
         break;
       case 'finish-step':
       case 'finish': {
+        closeSeg();
         const fr = ev.finishReason || ev.rawFinishReason;
         if (fr) finishReason = fr === 'tool-calls' ? 'tool_calls' : fr;
         if (ev.usage) usage = ev.usage;
@@ -299,42 +346,23 @@ export function commandCodeEventsToResponses(events, openaiModel, responsesReq) 
       default: break;
     }
   }
+  closeSeg();
 
-  // Assemble the typed `output` array. Order: reasoning (if any) -> message ->
-  // function_call items. Each gets a stable id.
-  const output = [];
-
-  if (reasoning) {
-    output.push({
-      type: 'reasoning',
-      id: shortId('rs_'),
-      summary: [{ type: 'summary_text', text: reasoning }],
-    });
-  }
-
-  // The assistant message is emitted whenever there is text OR there were no
-  // tool calls (so a plain text answer still yields a message item). When the
-  // model only emitted tool calls, the message item is omitted — matching the
-  // real Responses API behavior.
-  if (text || toolCalls.length === 0) {
-    output.push({
+  // The assistant message item is emitted whenever there is text OR there
+  // were no tool calls (so a plain text answer still yields a message item).
+  // When the model only emitted tool calls, the message item is omitted —
+  // matching the real Responses API behavior.
+  if (!items.some(i => i.type === 'message') && !items.some(i => i.type === 'function_call')) {
+    items.push({
       type: 'message',
       id: shortId('msg_'),
       role: 'assistant',
       status: 'completed',
-      content: [{ type: 'output_text', text, annotations: [] }],
+      content: [{ type: 'output_text', text: '', annotations: [] }],
     });
   }
 
-  for (const tc of toolCalls) {
-    output.push({
-      type: 'function_call',
-      id: shortId('fc_'),
-      call_id: tc.callId || shortId('call_'),
-      name: tc.name || '',
-      arguments: JSON.stringify(tc.input ?? {}),
-    });
-  }
+  const output = items;
 
   // status: "length"/"max-tokens" => incomplete; otherwise completed.
   let status = 'completed';

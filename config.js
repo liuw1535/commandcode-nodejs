@@ -149,6 +149,14 @@ function jsonEnv(v, def) {
   }
 }
 
+function bool(v, def) {
+  if (v === undefined || v === '') return def;
+  const s = String(v).toLowerCase();
+  if (s === '1' || s === 'true' || s === 'yes' || s === 'on') return true;
+  if (s === '0' || s === 'false' || s === 'no' || s === 'off') return false;
+  return def;
+}
+
 // --- load + merge ---
 const fileCfg = loadJsonFile(CONFIG_FILE);
 const cfg = deepMerge(DEFAULTS, fileCfg);
@@ -186,6 +194,11 @@ const MAX_TOKENS = num(env.MAX_TOKENS, cfg.generation.maxTokens);
 // Retry policy
 const RETRY_429_MAX = num(env.RETRY_429_MAX, cfg.retry['429'].max);
 const RETRY_429_BASE_MS = num(env.RETRY_429_BASE_MS, cfg.retry['429'].baseMs);
+
+// Debug: log whether the assembled commandcode /alpha/generate body injected
+// reasoning/thinking content (reasoning_effort param + reasoning message
+// blocks from prior turns). Off by default; enable via DEBUG_CC_BODY=1.
+const DEBUG_CC_BODY = bool(env.DEBUG_CC_BODY, false);
 
 // Hardware pools (JSON env overridable; replaces the whole pool)
 const HW_MACHINE_POOL = jsonEnv(env.HW_MACHINE_POOL, cfg.hardware.machinePool);
@@ -245,6 +258,9 @@ export const config = {
   // Retry
   RETRY_429_MAX,
   RETRY_429_BASE_MS,
+
+  // Debug flags
+  DEBUG_CC_BODY,
 
   // Hardware pools
   HW_MACHINE_POOL,

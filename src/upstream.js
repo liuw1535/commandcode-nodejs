@@ -32,6 +32,7 @@ export async function sendGenerate(credPool, buildBody) {
     await ensureWarmed(token, cred?.name, config.WARMUP_MODE);
     const session = getSessionForToken(token);
     const ccBody = buildBody(session, token);
+    //console.log(JSON.stringify(ccBody, null, 2))
     const headers = buildGenerateHeaders(token, session.sessionId, ccBody.threadId);
     // buildGenerateHeaders tucks {traceId, spanId} under a non-HTTP _trace key
     // so the caller can reuse them in the OTel span; strip it before sending.

@@ -237,6 +237,15 @@ export function createServer(credPool) {
         openaiError(res, 400, 'Missing or invalid "input" field');
         return done(400);
       }
+      // We keep no response store, so `previous_response_id` cannot be
+      // honored. Fail fast with a clear 400 instead of silently serving the
+      // request with lost history (stateless clients resend full `input`).
+      if (responsesReq.previous_response_id != null) {
+        openaiError(res, 400,
+          'previous_response_id is not supported: this proxy is stateless and stores no responses. Resend the full conversation in "input" (i.e. client-side store: false) instead.',
+          'previous_response_id_not_supported', 'invalid_request_error');
+        return done(400);
+      }
 
       const stream = responsesReq.stream === true;
       const openaiModel = responsesReq.model || config.MODELS.defaultModel;
