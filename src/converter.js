@@ -29,15 +29,21 @@ function toCcContent(openaiContent) {
       } else if (part.type === 'text') {
         if (part.text) out.push({ type: 'text', text: part.text });
       } else if (part.type === 'image_url') {
-        // Command Code supports image blocks as {type:"image", ...}; best-effort passthrough.
+        // Command Code's content-block union accepts the Anthropic-native
+        // image shapes verbatim (probed against the live upstream, see
+        // messagesConverter.js imageSourceToCc):
+        //   {type:"image", source:{type:"base64", media_type, data}}  -> accepted
+        //   {type:"image", source:{type:"url", url}}                   -> accepted
+        //   {type:"image", mediaType, data} / {type:"image", url}      -> rejected
+        // so image_url parts are normalized into the nested source shape.
         const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
         if (url) {
           if (url.startsWith('data:')) {
             const [meta, data] = url.split(',', 2);
             const media = meta.match(/data:([^;]+)/)?.[1] || 'image/png';
-            out.push({ type: 'image', mediaType: media, data: data || '' });
+            out.push({ type: 'image', source: { type: 'base64', media_type: media, data: data || '' } });
           } else {
-            out.push({ type: 'image', url });
+            out.push({ type: 'image', source: { type: 'url', url } });
           }
         }
       }

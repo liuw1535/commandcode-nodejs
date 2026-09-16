@@ -43,23 +43,25 @@ function partToCcBlock(part) {
     case 'text':
       return part.text ? { type: 'text', text: part.text } : null;
     case 'input_image': {
+      // Upstream only accepts the nested source shapes (see
+      // messagesConverter.js imageSourceToCc): {type:"image", source:{...}}.
       const url = part.image_url || part.url;
       if (!url && !part.file_id) return null;
       if (url && url.startsWith('data:')) {
         const [meta, data] = url.split(',', 2);
         const media = meta.match(/data:([^;]+)/)?.[1] || 'image/png';
-        return { type: 'image', mediaType: media, data: data || '' };
+        return { type: 'image', source: { type: 'base64', media_type: media, data: data || '' } };
       }
-      if (url) return { type: 'image', url };
+      if (url) return { type: 'image', source: { type: 'url', url } };
       // file_id without a URL — best-effort passthrough so upstream can reject.
-      return { type: 'image', url: part.file_id };
+      return { type: 'image', source: { type: 'url', url: part.file_id } };
     }
     case 'input_file':
       // Best-effort passthrough; commandcode has no first-class file block.
       if (part.file_data) {
         return { type: 'text', text: `[file: ${part.filename || part.file_id || 'unknown'}]` };
       }
-      if (part.file_url) return { type: 'image', url: part.file_url };
+      if (part.file_url) return { type: 'image', source: { type: 'url', url: part.file_url } };
       return null;
     default:
       return null;
