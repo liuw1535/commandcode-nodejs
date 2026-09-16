@@ -1,6 +1,6 @@
-# Command Code → OpenAI 兼容代理
+# Command Code → OpenAI / Anthropic 兼容代理
 
-基于抓包分析构建的代理服务，对外暴露标准 OpenAI Chat Completions API，对内转换为 Command Code 的 `/alpha/generate` 请求格式并转发。包含指纹模拟、凭证池轮询、429 重试、400 额度耗尽自动禁用。
+基于抓包分析构建的代理服务，对外暴露标准 OpenAI Chat Completions / Responses API 与 Anthropic Messages API（供 Claude Code 接入），对内转换为 Command Code 的 `/alpha/generate` 请求格式并转发。包含指纹模拟、凭证池轮询、429 重试、400 额度耗尽自动禁用。
 
 ## 快速开始
 
@@ -38,6 +38,8 @@ npm start
 |------|------|------|
 | POST | `/v1/chat/completions` | OpenAI Chat Completions（支持 `stream: true/false`、`tools`、`tool_calls`、`reasoning_content`） |
 | POST | `/v1/responses` | OpenAI Responses API（`input`/`instructions`/`output` Items、`reasoning`、流式语义事件） |
+| POST | `/v1/messages` | Anthropic Messages API（`stream: true/false`、`tools`、`tool_use`/`tool_result`、`thinking`、图片；供 Claude Code 接入） |
+| POST | `/v1/messages/count_tokens` | Anthropic count_tokens（本地粗估：文本字符数 / 4，不走上游） |
 | GET  | `/v1/models` | 返回可用模型列表 |
 | GET  | `/health` | 健康检查，返回可用凭证数 |
 | GET  | `/v1/credentials/status` | 各凭证 disabled 状态（需鉴权） |
@@ -81,6 +83,57 @@ curl -N http://localhost:3000/v1/responses \
     "stream": true
   }'
 ```
+
+### `/v1/messages` 示例（Anthropic Messages API）
+
+```bash
+# 非流式
+curl http://localhost:3000/v1/messages \
+  -H "x-api-key: $AUTH_TOKEN" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-5",
+    "max_tokens": 1024,
+    "messages": [{"role":"user","content":"数到3"}],
+    "stream": false
+  }'
+
+# 流式（message_start → ping → content_block_start → text_delta* →
+#   content_block_stop → message_delta → message_stop，带 event: 行）
+curl -N http://localhost:3000/v1/messages \
+  -H "x-api-key: $AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-5",
+    "max_tokens": 1024,
+    "messages": [{"role":"user","content":"你好"}],
+    "stream": true
+  }'
+```
+
+### Claude Code 接入
+
+Claude Code 原生支持自定义 API 端点，直接把 `ANTHROPIC_BASE_URL` 指向本代理即可：
+
+```bash
+# 方式一：ANTHROPIC_AUTH_TOKEN（发送 Authorization: Bearer）
+export ANTHROPIC_BASE_URL=http://<host>:3000
+export ANTHROPIC_AUTH_TOKEN=<代理的 AUTH_TOKEN>
+claude
+
+# 方式二：ANTHROPIC_API_KEY（发送 x-api-key 头，同样被接受）
+export ANTHROPIC_BASE_URL=http://<host>:3000
+export ANTHROPIC_API_KEY=<代理的 AUTH_TOKEN>
+claude
+```
+
+说明：
+- **鉴权**：代理同时接受 `Authorization: Bearer <token>` 与 `x-api-key: <token>`（任一匹配即通过），两种环境变量都能用；未设 `AUTH_TOKEN` 时不鉴权
+- **模型名**：`GET /v1/models` 列出的上游模型名可直接使用（如 `claude-sonnet-5`）；`model` 大小写不敏感匹配，未命中原样透传
+- **支持**：流式/非流式、`tools` + `tool_use`/`tool_result` 往返、`thinking`（回传的 thinking 块取文本、signature 丢弃）、`system`（字符串或多段块，含 `cache_control`）、base64/URL 图片、`/v1/messages/count_tokens`（本地粗估，供上下文压缩预判）
+- **不支持（静默忽略）**：`stop_sequences`、`tool_choice`、`temperature`/`top_p`、Anthropic 内置工具（`web_search` 等）；`thinking.budget_tokens` 不映射（推理强度用代理的 `REASONING_EFFORT` 默认值）
+- **`max_tokens`**：Anthropic 官方必填，但代理宽松处理——缺失时回退 `MAX_TOKENS` 配置，避免各版本 Claude Code 差异导致报错
 
 ## 模型供应
 
@@ -179,6 +232,8 @@ src/
   upstream.js          上游请求生命周期：轮询 + 指纹 + fetch + 遥测（API 风格无关）
   streamMapper.js       Command Code SSE → OpenAI Chat SSE 转换
   responsesStreamMapper.js Command Code SSE → OpenAI Responses 语义事件转换
+  messagesConverter.js  Anthropic Messages ↔ Command Code 格式转换（system/内容块/thinking/tool_use/tool_result；含非流式聚合与 count_tokens 粗估）
+  messagesStreamMapper.js Command Code SSE → Anthropic Messages 流式事件转换（message_start → content_block_* → message_delta → message_stop）
   openaiServer.js      HTTP 服务器 + 路由 + 鉴权 + 体积限制
 index.js              入口
 ```

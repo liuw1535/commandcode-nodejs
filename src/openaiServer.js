@@ -7,6 +7,8 @@ import { openaiToCommandCode, commandCodeEventsToOpenAI } from './converter.js';
 import { pipeStream } from './streamMapper.js';
 import { responsesToCommandCode, commandCodeEventsToResponses } from './responsesConverter.js';
 import { pipeResponsesStream } from './responsesStreamMapper.js';
+import { anthropicToCommandCode, commandCodeEventsToAnthropic, estimateInputTokens, stopReasonToFinishReason } from './messagesConverter.js';
+import { pipeMessagesStream } from './messagesStreamMapper.js';
 import { getModels } from './modelProvider.js';
 import { sendGenerate, readAllEvents, emitTelemetry } from './upstream.js';
 
@@ -17,6 +19,32 @@ function openaiError(res, status, message, code, type) {
   });
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body) });
   res.end(body);
+}
+
+// Anthropic-shaped error JSON ({type:"error", error:{type, message}}) for the
+// /v1/messages routes. `type` uses the standard Anthropic error types
+// (invalid_request_error / authentication_error / permission_error /
+// not_found_error / request_too_large / rate_limit_error / api_error /
+// overloaded_error).
+function anthropicError(res, status, type, message) {
+  const body = JSON.stringify({
+    type: 'error',
+    error: { type: type || 'api_error', message: message || 'error' },
+  });
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body) });
+  res.end(body);
+}
+
+// Map an upstream/HTTP status to the Anthropic error type.
+function anthropicErrorType(status) {
+  if (status === 400 || status === 422) return 'invalid_request_error';
+  if (status === 401 || status === 403) return 'authentication_error';
+  if (status === 404) return 'not_found_error';
+  if (status === 413) return 'request_too_large';
+  if (status === 429) return 'rate_limit_error';
+  if (status === 503) return 'overloaded_error';
+  if (status >= 500) return 'api_error';
+  return 'invalid_request_error';
 }
 
 function readBody(req, maxBytes) {
@@ -54,7 +82,7 @@ export function createServer(credPool) {
 
     // CORS
     res.setHeader('access-control-allow-origin', '*');
-    res.setHeader('access-control-allow-headers', 'authorization, content-type');
+    res.setHeader('access-control-allow-headers', 'authorization, content-type, x-api-key, anthropic-version');
     res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
     if (method === 'OPTIONS') { res.writeHead(204); res.end(); return done(204); }
 
@@ -67,11 +95,19 @@ export function createServer(credPool) {
     }
 
     // Auth check for everything else (when AUTH_TOKEN configured).
+    // Both `Authorization: Bearer <token>` and `x-api-key: <token>` are
+    // accepted (Anthropic clients — e.g. Claude Code with ANTHROPIC_API_KEY
+    // — send only the latter); any one match passes.
     if (config.AUTH_TOKEN) {
       const auth = req.headers['authorization'] || '';
-      const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-      if (token !== config.AUTH_TOKEN) {
-        openaiError(res, 401, 'Invalid authentication credentials', 'invalid_api_key', 'invalid_request_error');
+      const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+      const apiKey = typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'] : '';
+      if (bearer !== config.AUTH_TOKEN && apiKey !== config.AUTH_TOKEN) {
+        if (path.startsWith('/v1/messages')) {
+          anthropicError(res, 401, 'authentication_error', 'invalid x-api-key or authorization header');
+        } else {
+          openaiError(res, 401, 'Invalid authentication credentials', 'invalid_api_key', 'invalid_request_error');
+        }
         return done(401);
       }
     }
@@ -326,8 +362,146 @@ export function createServer(credPool) {
       }
     }
 
-    // 404
-    openaiError(res, 404, `Unknown route: ${method} ${path}`, 'not_found', 'invalid_request_error');
+    // Anthropic Messages API (Claude Code and other Anthropic clients)
+    if (method === 'POST' && path === '/v1/messages') {
+      let raw;
+      try {
+        raw = await readBody(req, config.MAX_BODY_BYTES);
+      } catch (e) {
+        if (e?.code === 'PAYLOAD_TOO_LARGE') {
+          anthropicError(res, 413, 'request_too_large', 'Request body exceeds size limit');
+          return done(413);
+        }
+        anthropicError(res, 400, 'invalid_request_error', `Failed to read body: ${e.message}`);
+        return done(400);
+      }
+
+      let anthropicReq;
+      try {
+        anthropicReq = JSON.parse(raw.toString('utf8'));
+      } catch {
+        anthropicError(res, 400, 'invalid_request_error', 'Invalid JSON in request body');
+        return done(400);
+      }
+      // messages is mandatory; max_tokens is NOT (Anthropic requires it, but
+      // we tolerate its absence and fall back to config.MAX_TOKENS so every
+      // Claude Code version works).
+      if (!anthropicReq || !Array.isArray(anthropicReq.messages)) {
+        anthropicError(res, 400, 'invalid_request_error', 'Missing or invalid "messages" field');
+        return done(400);
+      }
+
+      const stream = anthropicReq.stream === true;
+      const anthropicModel = anthropicReq.model || config.MODELS.defaultModel;
+      const reqStartNs = BigInt(Date.now()) * 1000000n;
+
+      let upstreamRes, captured;
+      try {
+        const result = await sendGenerate(credPool, (session) => anthropicToCommandCode(anthropicReq, session));
+        upstreamRes = result.upstreamRes;
+        captured = result.captured;
+      } catch (e) {
+        const status = e.statusCode || 502;
+        anthropicError(res, status, anthropicErrorType(status), e.message || 'upstream error');
+        return done(status);
+      }
+
+      if (!upstreamRes.ok && upstreamRes.status >= 400) {
+        const text = await upstreamRes.text().catch(() => '');
+        anthropicError(res, upstreamRes.status, anthropicErrorType(upstreamRes.status), `upstream error: ${text || upstreamRes.statusText}`);
+        return done(upstreamRes.status);
+      }
+
+      if (stream) {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache',
+          'connection': 'keep-alive',
+          'x-accel-buffering': 'no',
+        });
+        let pipeResult = null;
+        try {
+          pipeResult = await pipeMessagesStream({ res, upstream: upstreamRes, anthropicModel });
+        } catch (e) {
+          log.error(`[messages stream] pipe error: ${e?.message || e}`);
+          try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'stream error: ' + (e?.message || e) } })}\n\n`); } catch { }
+        }
+        res.end();
+        if (captured && pipeResult) {
+          emitTelemetry(captured, {
+            inputTokens: pipeResult.inputTokens,
+            outputTokens: pipeResult.outputTokens,
+            cachedInputTokens: pipeResult.cachedInputTokens,
+            finishReasons: pipeResult.finishReasons,
+            ttftMs: pipeResult.ttftMs,
+          }, reqStartNs, BigInt(Date.now()) * 1000000n);
+        }
+        return done(200);
+      } else {
+        // Aggregate upstream SSE into a single Anthropic message object.
+        try {
+          const events = await readAllEvents(upstreamRes);
+          const resp = commandCodeEventsToAnthropic(events, anthropicModel);
+          resp.model = anthropicModel;
+          // Extract usage for telemetry (Anthropic-shaped usage fields).
+          let nsInput = null, nsOutput = null, nsCached = null;
+          if (resp.usage) {
+            nsInput = resp.usage.input_tokens;
+            nsOutput = resp.usage.output_tokens;
+            if (typeof resp.usage.cache_read_input_tokens === 'number') nsCached = resp.usage.cache_read_input_tokens;
+          }
+          const nsFinish = [stopReasonToFinishReason(resp.stop_reason)];
+          const body = JSON.stringify(resp);
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(body);
+          emitTelemetry(captured, {
+            inputTokens: nsInput,
+            outputTokens: nsOutput,
+            finishReasons: nsFinish,
+            cachedInputTokens: nsCached,
+          }, reqStartNs, BigInt(Date.now()) * 1000000n);
+          return done(200);
+        } catch (e) {
+          log.error(`[messages nonstream] error: ${e?.message || e}`);
+          anthropicError(res, 502, 'api_error', `failed to read upstream: ${e?.message || e}`);
+          return done(502);
+        }
+      }
+    }
+
+    // Anthropic count_tokens: local rough estimate (chars/4), no upstream call.
+    if (method === 'POST' && path === '/v1/messages/count_tokens') {
+      let raw;
+      try {
+        raw = await readBody(req, config.MAX_BODY_BYTES);
+      } catch (e) {
+        if (e?.code === 'PAYLOAD_TOO_LARGE') {
+          anthropicError(res, 413, 'request_too_large', 'Request body exceeds size limit');
+          return done(413);
+        }
+        anthropicError(res, 400, 'invalid_request_error', `Failed to read body: ${e.message}`);
+        return done(400);
+      }
+      let ctReq;
+      try {
+        ctReq = JSON.parse(raw.toString('utf8'));
+      } catch {
+        anthropicError(res, 400, 'invalid_request_error', 'Invalid JSON in request body');
+        return done(400);
+      }
+      const inputTokens = estimateInputTokens(ctReq);
+      const body = JSON.stringify({ input_tokens: inputTokens });
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(body);
+      return done(200);
+    }
+
+    // 404: Anthropic-shaped for unknown /v1/messages sub-paths, openai-shaped else.
+    if (path.startsWith('/v1/messages')) {
+      anthropicError(res, 404, 'not_found_error', `Unknown route: ${method} ${path}`);
+    } else {
+      openaiError(res, 404, `Unknown route: ${method} ${path}`, 'not_found', 'invalid_request_error');
+    }
     return done(404);
   });
   return server;
