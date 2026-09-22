@@ -114,10 +114,40 @@ curl http://localhost:3000/v1/messages \
 ```bash
 export ANTHROPIC_BASE_URL=http://<host>:3000
 export ANTHROPIC_AUTH_TOKEN=<AUTH_TOKEN>
+export ANTHROPIC_MODEL=zai-org/GLM-5.3
 claude
 ```
 
 也可以使用 `ANTHROPIC_API_KEY`；该模式会通过 `x-api-key` 请求头发送鉴权 token。
+
+## Codex 接入
+
+Codex 仅支持 Responses 协议（`wire_api` 唯一合法值为 `"responses"`），本代理已实现 `/v1/responses`，可直连，无需额外的协议转换层。
+
+在用户级 `~/.codex/config.toml` 中配置自定义 provider（注意：`model_provider` / `model_providers` 写在项目级 `.codex/config.toml` 中会被忽略；内置 ID `openai` / `ollama` / `lmstudio` 为保留字，不能用）：
+
+```toml
+model = "zai-org/GLM-5.3"
+model_provider = "commandcode"
+
+[model_providers.commandcode]
+name = "Command Code"
+base_url = "http://<host>:3000/v1"
+env_key = "COMMANDCODE_API_KEY"
+wire_api = "responses"
+```
+
+然后设置鉴权并启动：
+
+```bash
+export COMMANDCODE_API_KEY=<AUTH_TOKEN>
+codex
+```
+
+- 鉴权也可以不用环境变量，直接在 provider 中写 `experimental_bearer_token = "<AUTH_TOKEN>"`。
+- 本地鉴权未启用（`AUTH_TOKEN` 为空）时，可省略 `env_key`，此时 Codex 认为端点无需认证，直接请求即可。
+- 顶层 `preferred_auth_method` 只作用于内置 `openai` provider 的登录方式，对自定义 provider 无效（且已在 Codex 0.35.0 中移除），无需配置。
+- 可选调优：`request_max_retries`（默认 4）、`stream_idle_timeout_ms`（默认 300000）。
 
 ## 兼容性概览
 
