@@ -56,6 +56,16 @@ const DEFAULTS = {
     //   'lazy-async' : warm on first rotation in background (non-blocking).
     //   'off'        : never warm up.
     mode: 'startup',
+    // Idle session rotation. When a credential sits unused longer than this
+    // many hours, the NEXT request to it regenerates the ephemeral session
+    // identity (sessionId / threadId / pid) — keeping the stable machine
+    // identity (installId / thumbmark) — and re-emits a fresh CLI startup
+    // telemetry burst, simulating "user closed the CLI and reopened it later".
+    // This avoids a single session.id staying alive across a multi-hour gap
+    // with no activity, which is a weak fingerprint tell.
+    //   0 disables idle rotation (current behavior).
+    //   Example: 6 -> rotate after 6h of inactivity on a credential.
+    idleRotateHours: 6,
   },
   hardware: {
     machinePool: [
@@ -182,6 +192,10 @@ const STATE_DIR = str(env.STATE_DIR, cfg.stateDir);
 
 // Credential warmup policy (see config.json warmup.mode).
 const WARMUP_MODE = str(env.WARMUP_MODE, cfg.warmup.mode);
+// Idle session rotation threshold (see config.json warmup.idleRotateHours).
+// 0 disables. Stored as ms internally for fingerprint.js to compare against.
+const WARMUP_IDLE_ROTATE_HOURS = num(env.WARMUP_IDLE_ROTATE_HOURS, cfg.warmup.idleRotateHours);
+const WARMUP_IDLE_ROTATE_MS = WARMUP_IDLE_ROTATE_HOURS > 0 ? WARMUP_IDLE_ROTATE_HOURS * 3600000 : 0;
 
 // Upstream model list refresh interval (the list itself is fetched from
 // /provider/v1/models at startup and on this timer; see src/modelProvider.js).
@@ -246,6 +260,7 @@ export const config = {
 
   // Warmup policy
   WARMUP_MODE,
+  WARMUP_IDLE_ROTATE_MS,
 
   // Models
   MODELS: { defaultModel: cfg.models.defaultModel },

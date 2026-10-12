@@ -11,7 +11,7 @@
 // /v1/responses route reuses this verbatim — only its converter + stream
 // mapper differ.
 import config from '../config.js';
-import { ensureWarmed, getSessionForToken, buildGenerateHeaders } from './fingerprint.js';
+import { ensureWarmed, maybeRotateOnIdle, getSessionForToken, buildGenerateHeaders } from './fingerprint.js';
 import { emitApiSpan } from './telemetry.js';
 
 // Send a commandcode /alpha/generate request with full credential rotation +
@@ -29,6 +29,10 @@ export async function sendGenerate(credPool, buildBody) {
 
   const upstreamRes = await credPool.requestWithRotation(async (token) => {
     const cred = credPool.find(token);
+    // If this credential has been idle past the configured threshold, rotate
+    // its ephemeral session identity + emit a fresh startup burst BEFORE this
+    // request goes out (simulating a CLI restart). No-op when disabled.
+    await maybeRotateOnIdle(token, cred?.name);
     await ensureWarmed(token, cred?.name, config.WARMUP_MODE);
     const session = getSessionForToken(token);
     const ccBody = buildBody(session, token);

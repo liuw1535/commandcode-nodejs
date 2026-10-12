@@ -36,8 +36,9 @@
   "stateDir": "./.state",
   "projectSlug": "",
   "warmup": {
-    "_comment": "Credential fingerprint warmup policy. mode: 'startup' = warm all enabled creds in background at boot (legacy default); 'lazy' = warm on first rotation, await before first /alpha/generate (first request on that token pays extra latency); 'lazy-async' = warm on first rotation in background, send generate immediately (non-blocking); 'off' = never warm up.",
-    "mode": "lazy"
+    "_comment": "Credential fingerprint warmup policy. mode: 'startup' = warm all enabled creds in background at boot (legacy default); 'lazy' = warm on first rotation, await before first /alpha/generate (first request on that token pays extra latency); 'lazy-async' = warm on first rotation in background, send generate immediately (non-blocking); 'off' = never warm up. idleRotateHours = regenerate the ephemeral session identity (sessionId/threadId/pid, keeping installId/thumbmark) and re-emit a fresh CLI startup telemetry burst when a credential sits unused longer than this many hours, simulating 'user closed the CLI and reopened it later'. 0 disables. Example: 6.",
+    "mode": "lazy",
+    "idleRotateHours": 6
   },
   "hardware": {
     "machinePool": [

@@ -108,6 +108,10 @@ function makeSession(token) {
     projectSlug: identity.projectSlug,
     user: identity.user || null,
     warmed: false, warming: null,
+    // Wall-clock ms of the last request served by this credential. Used by
+    // maybeRotateOnIdle to detect long idle gaps and rotate the ephemeral
+    // session identity (simulating a CLI restart). null = never used yet.
+    lastActivityAt: null,
   };
 }
 
@@ -293,8 +297,61 @@ export async function ensureWarmed(token, name, mode) {
   return s;
 }
 
+// Regenerate the per-launch ephemera on an existing session (sessionId /
+// threadId / pid) while preserving the stable machine identity (installId /
+// thumbmark / components / user). This mirrors what a real CLI does on each
+// launch: same machine, fresh session id + conversation thread + process pid.
+function rotateEphemera(s) {
+  s.sessionId = 'sess_' + randomHex(8);
+  s.threadId = randomUUID();
+  s.pid = 3000 + Math.floor(Math.random() * 12000);
+  s.warmed = false;
+  s.warming = null;
+}
+
+// Idle session rotation. Call this at the start of every generate request.
+// If the credential has been idle longer than the configured threshold, rotate
+// the ephemeral session identity and re-run the full warmup sequence (which
+// emits a fresh session:cli + command:interactive startup burst, exactly like
+// a real CLI launch) BEFORE this request is sent. The machine identity stays
+// stable, so it looks like "same machine, CLI reopened later".
+//
+//   - Disabled (WARMUP_IDLE_ROTATE_MS = 0) or warmup mode 'off': no-op.
+//   - First-ever use (no lastActivityAt yet): just stamps the timestamp; the
+//     initial warmup/startup burst is handled by warmup mode (startup/lazy).
+//   - In-flight rotation warmup is stored on s.warming so concurrent requests
+//     after the same idle gap share one rotation, not duplicate bursts.
+export async function maybeRotateOnIdle(token, name) {
+  const s = getSession(token);
+  const now = Date.now();
+  const prev = s.lastActivityAt;
+  // Stamp activity for this request unconditionally so the next idle gap is
+  // measured from here.
+  s.lastActivityAt = now;
+
+  const thresholdMs = config.WARMUP_IDLE_ROTATE_MS;
+  if (!thresholdMs) return;                 // idle rotation disabled
+  if (config.WARMUP_MODE === 'off') return;  // user opted out of all warmup
+  if (!prev) return;                         // never used yet — initial warmup covers it
+  const idleMs = now - prev;
+  if (idleMs < thresholdMs) return;
+
+  const label = name || token.slice(-6);
+  const idleH = Math.round(idleMs / 3600000);
+  log.info(`[fingerprint] ${label} idle ${idleH}h >= ${Math.round(thresholdMs / 3600000)}h threshold — rotating ephemeral session (simulating CLI restart)`);
+  rotateEphemera(s);
+  // Re-run the startup sequence against the fresh session identity. warmup()
+  // emits the session:cli + command:interactive burst, re-fetches whoami /
+  // lifecycle / fingerprint / billing, and sets s.warmed=true on success.
+  // Await so this generate request goes out under the new session identity.
+  s.warming = warmup(token, name)
+    .catch(() => {}) // warmup logs internally; swallow to always settle
+    .finally(() => { s.warming = null; });
+  await s.warming;
+}
+
 export function getSessionForToken(token) {
   return getSession(token);
 }
 
-export default { warmup, ensureWarmed, buildGenerateHeaders, getSessionForToken };
+export default { warmup, ensureWarmed, maybeRotateOnIdle, buildGenerateHeaders, getSessionForToken };
