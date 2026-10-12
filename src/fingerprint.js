@@ -109,9 +109,19 @@ function makeSession(token) {
     user: identity.user || null,
     warmed: false, warming: null,
     // Wall-clock ms of the last request served by this credential. Used by
-    // maybeRotateOnIdle to detect long idle gaps and rotate the ephemeral
-    // session identity (simulating a CLI restart). null = never used yet.
+    // maybeRotateOnIdle / sweepIdleRotation to detect long idle gaps and
+    // rotate the ephemeral session identity (simulating a CLI restart). null
+    // = never used yet (boot session left as-is).
     lastActivityAt: null,
+    // The value of `lastActivityAt` that we last rotated FOR. Guards against
+    // (a) rotating the same idle gap twice and (b) endlessly rotating a cred
+    // that has had no new activity since its last rotation. null = never
+    // rotated yet.
+    lastRotatedActivityAt: null,
+    // Per-credential jitter on the idle threshold, in [-0.2, 0.2]. Effective
+    // threshold = WARMUP_IDLE_ROTATE_MS * (1 + idleJitter). Prevents all
+    // credentials from rotating in lockstep (a periodicity tell).
+    idleJitter: Math.random() * 0.4 - 0.2,
   };
 }
 
@@ -309,49 +319,108 @@ function rotateEphemera(s) {
   s.warming = null;
 }
 
-// Idle session rotation. Call this at the start of every generate request.
+// Idle session rotation. Called at the start of every generate request.
 // If the credential has been idle longer than the configured threshold, rotate
 // the ephemeral session identity and re-run the full warmup sequence (which
 // emits a fresh session:cli + command:interactive startup burst, exactly like
 // a real CLI launch) BEFORE this request is sent. The machine identity stays
 // stable, so it looks like "same machine, CLI reopened later".
 //
-//   - Disabled (WARMUP_IDLE_ROTATE_MS = 0) or warmup mode 'off': no-op.
-//   - First-ever use (no lastActivityAt yet): just stamps the timestamp; the
-//     initial warmup/startup burst is handled by warmup mode (startup/lazy).
-//   - In-flight rotation warmup is stored on s.warming so concurrent requests
-//     after the same idle gap share one rotation, not duplicate bursts.
+// Mode alignment:
+//   'lazy'/'lazy-async' — REACTIVE: rotate per-token here, at request time.
+//     'lazy'      awaits the rotation warmup so the request goes out under the
+//                 fresh session id (first post-idle request pays warmup
+//                 latency, same contract as lazy's first-use warmup).
+//     'lazy-async' fire-and-forget the warmup, honoring that mode's non-blocking
+//                 contract (the request goes out on the fresh id immediately).
+//   'startup'         — PROACTIVE: rotation is owned by sweepIdleRotation()
+//     (a background timer), NOT here. Returning early keeps startup's
+//     "requests never wait" contract; the sweep bounds staleness to <= one
+//     sweep interval (~60s), which is noise.
+//   'off' / threshold 0 — no-op.
+//
+// Guard: `prev === s.lastRotatedActivityAt` skips rotation when we already
+// rotated for this exact idle-gap start. This prevents (a) a concurrent
+// request re-rotating the gap the first one just handled, and (b) under the
+// startup sweep, a credential with no new activity being rotated again on
+// every sweep tick (which would emit a periodic startup burst for a dead
+// account — both wasted upstream calls and a periodicity tell).
 export async function maybeRotateOnIdle(token, name) {
   const s = getSession(token);
   const now = Date.now();
   const prev = s.lastActivityAt;
   // Stamp activity for this request unconditionally so the next idle gap is
-  // measured from here.
+  // measured from here, AND so a concurrent request sharing this same moment
+  // sees an idle gap of ~0 and skips rotation (no duplicate startup burst).
   s.lastActivityAt = now;
 
   const thresholdMs = config.WARMUP_IDLE_ROTATE_MS;
-  if (!thresholdMs) return;                 // idle rotation disabled
-  if (config.WARMUP_MODE === 'off') return;  // user opted out of all warmup
-  if (!prev) return;                         // never used yet — initial warmup covers it
+  if (!thresholdMs) return;                  // idle rotation disabled
+  if (config.WARMUP_MODE === 'off') return;   // user opted out of all warmup
+  if (config.WARMUP_MODE === 'startup') return; // sweep owns it (proactive)
+  if (!prev) return;                          // never used yet — initial warmup covers it
   const idleMs = now - prev;
-  if (idleMs < thresholdMs) return;
+  const effThreshold = thresholdMs * (1 + s.idleJitter);
+  if (idleMs < effThreshold) return;
+  if (prev === s.lastRotatedActivityAt) return; // already rotated for this idle gap
 
   const label = name || token.slice(-6);
   const idleH = Math.round(idleMs / 3600000);
-  log.info(`[fingerprint] ${label} idle ${idleH}h >= ${Math.round(thresholdMs / 3600000)}h threshold — rotating ephemeral session (simulating CLI restart)`);
+  log.info(`[fingerprint] ${label} idle ${idleH}h >= ${Math.round(effThreshold / 3600000)}h threshold — rotating ephemeral session (reactive, mode=${config.WARMUP_MODE})`);
+  s.lastRotatedActivityAt = prev;
   rotateEphemera(s);
   // Re-run the startup sequence against the fresh session identity. warmup()
   // emits the session:cli + command:interactive burst, re-fetches whoami /
   // lifecycle / fingerprint / billing, and sets s.warmed=true on success.
-  // Await so this generate request goes out under the new session identity.
+  // Publish the in-flight warmup on s.warming so a concurrent ensureWarmed()
+  // call (lazy mode) reuses it instead of starting a second one.
   s.warming = warmup(token, name)
     .catch(() => {}) // warmup logs internally; swallow to always settle
     .finally(() => { s.warming = null; });
-  await s.warming;
+  // In 'lazy' mode block until the fresh identity is ready, so this request
+  // goes out under the new session id. In 'lazy-async' mode honor that mode's
+  // non-blocking contract and let warmup race alongside the request.
+  if (config.WARMUP_MODE === 'lazy') await s.warming;
+}
+
+// Proactive idle-rotation sweep, used only under warmup mode 'startup'.
+// Runs on a timer (see index.js) and, for every enabled credential that has
+// been used at least once (lastActivityAt != null) and sat idle past its
+// jittered threshold, rotates the ephemeral session identity and re-emits a
+// fresh startup burst in the background (fire-and-forget — startup mode is
+// non-blocking). Credentials that have never been used keep their boot
+// session; credentials with no NEW activity since their last rotation are
+// skipped (the `prev === lastRotatedActivityAt` guard), so a dead account is
+// never rotated on a pointless periodic timer.
+export function sweepIdleRotation(credPool) {
+  const thresholdMs = config.WARMUP_IDLE_ROTATE_MS;
+  if (!thresholdMs) return;
+  if (config.WARMUP_MODE !== 'startup') return; // sweep only under startup
+  const now = Date.now();
+  for (const cred of credPool.creds) {
+    if (!cred.enabled || cred.disabled) continue;
+    const s = sessions.get(cred.token);
+    if (!s) continue; // no session yet (e.g. boot warmup still pending) — skip
+    const prev = s.lastActivityAt;
+    if (!prev) continue;                          // never used — leave boot session
+    if (prev === s.lastRotatedActivityAt) continue; // already rotated for this gap
+    const effThreshold = thresholdMs * (1 + s.idleJitter);
+    const idleMs = now - prev;
+    if (idleMs < effThreshold) continue;
+    const label = cred.name || cred.token.slice(-6);
+    const idleH = Math.round(idleMs / 3600000);
+    log.info(`[fingerprint] ${label} idle ${idleH}h >= ${Math.round(effThreshold / 3600000)}h threshold — rotating ephemeral session (proactive sweep)`);
+    s.lastRotatedActivityAt = prev;
+    rotateEphemera(s);
+    // Fire-and-forget: startup mode never blocks a request. The startup burst
+    // races alongside; a generate arriving during it goes out on the fresh
+    // session id, consistent with how boot warmup races the first request.
+    warmup(cred.token, cred.name).catch(() => {}).finally(() => {});
+  }
 }
 
 export function getSessionForToken(token) {
   return getSession(token);
 }
 
-export default { warmup, ensureWarmed, maybeRotateOnIdle, buildGenerateHeaders, getSessionForToken };
+export default { warmup, ensureWarmed, maybeRotateOnIdle, sweepIdleRotation, buildGenerateHeaders, getSessionForToken };

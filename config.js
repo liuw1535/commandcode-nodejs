@@ -63,9 +63,12 @@ const DEFAULTS = {
     // telemetry burst, simulating "user closed the CLI and reopened it later".
     // This avoids a single session.id staying alive across a multi-hour gap
     // with no activity, which is a weak fingerprint tell.
-    //   0 disables idle rotation (current behavior).
+    //   0 disables idle rotation (current default — opt-in via config.json).
     //   Example: 6 -> rotate after 6h of inactivity on a credential.
-    idleRotateHours: 6,
+    idleRotateHours: 0,
+    // Background sweep interval for the startup-mode idle rotation (ms).
+    // Only used when idleRotateHours > 0 and warmup.mode is 'startup'.
+    idleRotateSweepMs: 60000,
   },
   hardware: {
     machinePool: [
@@ -196,6 +199,11 @@ const WARMUP_MODE = str(env.WARMUP_MODE, cfg.warmup.mode);
 // 0 disables. Stored as ms internally for fingerprint.js to compare against.
 const WARMUP_IDLE_ROTATE_HOURS = num(env.WARMUP_IDLE_ROTATE_HOURS, cfg.warmup.idleRotateHours);
 const WARMUP_IDLE_ROTATE_MS = WARMUP_IDLE_ROTATE_HOURS > 0 ? WARMUP_IDLE_ROTATE_HOURS * 3600000 : 0;
+// How often the startup-mode idle-rotation background sweep checks credentials
+// (ms). The sweep is non-blocking and only fires a startup burst when a cred
+// actually crosses the idle threshold, so a short interval is cheap. 60s keeps
+// the worst-case staleness of a rotated session to <= one interval.
+const WARMUP_IDLE_SWEEP_MS = num(env.WARMUP_IDLE_SWEEP_MS, cfg.warmup.idleRotateSweepMs) || 60000;
 
 // Upstream model list refresh interval (the list itself is fetched from
 // /provider/v1/models at startup and on this timer; see src/modelProvider.js).
@@ -261,6 +269,7 @@ export const config = {
   // Warmup policy
   WARMUP_MODE,
   WARMUP_IDLE_ROTATE_MS,
+  WARMUP_IDLE_SWEEP_MS,
 
   // Models
   MODELS: { defaultModel: cfg.models.defaultModel },

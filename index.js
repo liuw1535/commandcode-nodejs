@@ -2,7 +2,7 @@
 import config from './config.js';
 import log from './logger.js';
 import { CredentialPool } from './src/credPool.js';
-import { warmup } from './src/fingerprint.js';
+import { warmup, sweepIdleRotation } from './src/fingerprint.js';
 import { createServer } from './src/openaiServer.js';
 import { init as initModels, getModelIds } from './src/modelProvider.js';
 
@@ -19,6 +19,7 @@ async function main() {
     process.exit(1);
   }
 
+  let sweepTimer = null;
   // Warm up fingerprints according to config.WARMUP_MODE:
   //   'startup'    -> fan out warmup for every enabled credential now (legacy).
   //   'lazy' / 'lazy-async' -> warm per credential on first rotation
@@ -38,6 +39,14 @@ async function main() {
       log.info(`[startup] warmup mode=startup, warming up ${warmupCreds.length} credential(s) in background...`);
       Promise.allSettled(warmupCreds.map(c => warmup(c.token, c.name)))
         .then(() => log.info('[startup] warmup complete'));
+      // Under startup mode, idle rotation is proactive: a background sweep
+      // rotates+rewarms credentials that have been used then sat idle past the
+      // threshold, so requests never wait and never hit a stale session id.
+      if (config.WARMUP_IDLE_ROTATE_MS > 0) {
+        sweepTimer = setInterval(() => sweepIdleRotation(credPool), config.WARMUP_IDLE_SWEEP_MS);
+        sweepTimer.unref?.();
+        log.info(`[startup] idle rotation sweep enabled (every ${Math.round(config.WARMUP_IDLE_SWEEP_MS / 1000)}s, threshold ${Math.round(config.WARMUP_IDLE_ROTATE_MS / 3600000)}h)`);
+      }
       break;
     }
   }
@@ -55,6 +64,7 @@ async function main() {
 
   const shutdown = (sig) => {
     log.info(`[shutdown] ${sig} received, closing server`);
+    if (sweepTimer) clearInterval(sweepTimer);
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
   };
