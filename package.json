@@ -5,7 +5,8 @@
   "description": "OpenAI-compatible proxy for Command Code (api.commandcode.ai) with fingerprint simulation and credential rotation.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

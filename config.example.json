@@ -6,7 +6,7 @@
   },
   "commandcode": {
     "base": "https://api.commandcode.ai",
-    "cliVersion": "1.50.1",
+    "cliVersion": "1.79.2",
     "userAgent": "cli",
     "endpoints": {
       "whoami": "/alpha/whoami",
