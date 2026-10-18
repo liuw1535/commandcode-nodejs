@@ -14,6 +14,7 @@ import { sendGenerate, readAllEvents, emitTelemetry } from './upstream.js';
 
 // OpenAI-shaped error JSON.
 function openaiError(res, status, message, code, type) {
+  if (res.writableEnded || res.destroyed) return;
   const body = JSON.stringify({
     error: { message, type: type || 'invalid_request_error', code: code || null },
   });
@@ -27,6 +28,7 @@ function openaiError(res, status, message, code, type) {
 // not_found_error / request_too_large / rate_limit_error / api_error /
 // overloaded_error).
 function anthropicError(res, status, type, message) {
+  if (res.writableEnded || res.destroyed) return;
   const body = JSON.stringify({
     type: 'error',
     error: { type: type || 'api_error', message: message || 'error' },
@@ -77,6 +79,20 @@ export function createServer(credPool) {
     const t0 = Date.now();
     const path = req.url.split('?')[0];
     const method = req.method;
+
+    // Abort upstream the moment the client disconnects before the response
+    // completes. Without this the proxy keeps draining the (quota-billed)
+    // upstream SSE and writing into a closed socket — pure waste. The signal
+    // is threaded into sendGenerate's fetch and the stream mappers so they
+    // stop reading/writing as soon as the client is gone.
+    const abortController = new AbortController();
+    const clientSignal = abortController.signal;
+    res.on('close', () => {
+      if (!res.writableEnded) abortController.abort();
+    });
+    // Swallow write errors on a dead connection (EPIPE / write-after-end) so
+    // a disconnecting client can never crash the process.
+    res.on('error', () => {});
 
     const done = (status) => log.request(method, path, status, Date.now() - t0);
 
@@ -167,11 +183,11 @@ export function createServer(credPool) {
       // their own buildBody here.
       let upstreamRes, captured;
       try {
-        const result = await sendGenerate(credPool, (session) => openaiToCommandCode(openaiReq, session));
+        const result = await sendGenerate(credPool, (session) => openaiToCommandCode(openaiReq, session), clientSignal);
         upstreamRes = result.upstreamRes;
         captured = result.captured;
       } catch (e) {
-        const status = e.statusCode || 502;
+        const status = clientSignal.aborted ? 499 : (e.statusCode || 502);
         openaiError(res, status, e.message || 'upstream error', null, 'invalid_request_error');
         return done(status);
       }
@@ -193,7 +209,7 @@ export function createServer(credPool) {
         let pipeResult = null;
         try {
           pipeResult = await pipeStream({
-            res, upstream: upstreamRes, openaiModel, includeUsage,
+            res, upstream: upstreamRes, openaiModel, includeUsage, signal: clientSignal,
           });
         } catch (e) {
           log.error(`[stream] pipe error: ${e?.message || e}`);
@@ -239,9 +255,9 @@ export function createServer(credPool) {
           }, reqStartNs, BigInt(Date.now()) * 1000000n);
           return done(200);
         } catch (e) {
-          log.error(`[nonstream] error: ${e?.message || e}`);
+          if (!clientSignal.aborted) log.error(`[nonstream] error: ${e?.message || e}`);
           openaiError(res, 502, `failed to read upstream: ${e?.message || e}`);
-          return done(502);
+          return done(clientSignal.aborted ? 499 : 502);
         }
       }
     }
@@ -289,11 +305,11 @@ export function createServer(credPool) {
 
       let upstreamRes, captured;
       try {
-        const result = await sendGenerate(credPool, (session) => responsesToCommandCode(responsesReq, session));
+        const result = await sendGenerate(credPool, (session) => responsesToCommandCode(responsesReq, session), clientSignal);
         upstreamRes = result.upstreamRes;
         captured = result.captured;
       } catch (e) {
-        const status = e.statusCode || 502;
+        const status = clientSignal.aborted ? 499 : (e.statusCode || 502);
         openaiError(res, status, e.message || 'upstream error', null, 'invalid_request_error');
         return done(status);
       }
@@ -314,7 +330,7 @@ export function createServer(credPool) {
         let pipeResult = null;
         try {
           pipeResult = await pipeResponsesStream({
-            res, upstream: upstreamRes, openaiModel, responsesReq,
+            res, upstream: upstreamRes, openaiModel, responsesReq, signal: clientSignal,
           });
         } catch (e) {
           log.error(`[responses stream] pipe error: ${e?.message || e}`);
@@ -355,9 +371,9 @@ export function createServer(credPool) {
           }, reqStartNs, BigInt(Date.now()) * 1000000n);
           return done(200);
         } catch (e) {
-          log.error(`[responses nonstream] error: ${e?.message || e}`);
+          if (!clientSignal.aborted) log.error(`[responses nonstream] error: ${e?.message || e}`);
           openaiError(res, 502, `failed to read upstream: ${e?.message || e}`);
-          return done(502);
+          return done(clientSignal.aborted ? 499 : 502);
         }
       }
     }
@@ -397,11 +413,11 @@ export function createServer(credPool) {
 
       let upstreamRes, captured;
       try {
-        const result = await sendGenerate(credPool, (session) => anthropicToCommandCode(anthropicReq, session));
+        const result = await sendGenerate(credPool, (session) => anthropicToCommandCode(anthropicReq, session), clientSignal);
         upstreamRes = result.upstreamRes;
         captured = result.captured;
       } catch (e) {
-        const status = e.statusCode || 502;
+        const status = clientSignal.aborted ? 499 : (e.statusCode || 502);
         anthropicError(res, status, anthropicErrorType(status), e.message || 'upstream error');
         return done(status);
       }
@@ -421,7 +437,7 @@ export function createServer(credPool) {
         });
         let pipeResult = null;
         try {
-          pipeResult = await pipeMessagesStream({ res, upstream: upstreamRes, anthropicModel });
+          pipeResult = await pipeMessagesStream({ res, upstream: upstreamRes, anthropicModel, signal: clientSignal });
         } catch (e) {
           log.error(`[messages stream] pipe error: ${e?.message || e}`);
           try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'stream error: ' + (e?.message || e) } })}\n\n`); } catch { }
@@ -462,9 +478,9 @@ export function createServer(credPool) {
           }, reqStartNs, BigInt(Date.now()) * 1000000n);
           return done(200);
         } catch (e) {
-          log.error(`[messages nonstream] error: ${e?.message || e}`);
+          if (!clientSignal.aborted) log.error(`[messages nonstream] error: ${e?.message || e}`);
           anthropicError(res, 502, 'api_error', `failed to read upstream: ${e?.message || e}`);
-          return done(502);
+          return done(clientSignal.aborted ? 499 : 502);
         }
       }
     }

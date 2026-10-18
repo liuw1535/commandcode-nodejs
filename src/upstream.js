@@ -24,7 +24,7 @@ import { emitApiSpan } from './telemetry.js';
 // Returns { upstreamRes, captured } where `captured` holds the telemetry
 // context (session/threadId/model/trace/toolCount) of the credential that
 // actually served the request, for the caller to feed into emitTelemetry.
-export async function sendGenerate(credPool, buildBody) {
+export async function sendGenerate(credPool, buildBody, signal) {
   let captured = null;
 
   const upstreamRes = await credPool.requestWithRotation(async (token) => {
@@ -54,6 +54,7 @@ export async function sendGenerate(credPool, buildBody) {
       method: 'POST',
       headers,
       body: JSON.stringify(ccBody),
+      ...(signal ? { signal } : {}),
     });
   });
 

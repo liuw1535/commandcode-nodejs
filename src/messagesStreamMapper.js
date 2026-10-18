@@ -36,7 +36,7 @@ const { randomUUID } = crypto;
 //   res: node http.ServerResponse (already writing SSE)
 //   upstream: fetch Response (body is a ReadableStream)
 //   anthropicModel: model name to echo back
-export async function pipeMessagesStream({ res, upstream, anthropicModel }) {
+export async function pipeMessagesStream({ res, upstream, anthropicModel, signal }) {
   const msgId = 'msg_' + randomUUID().replace(/-/g, '');
   const model = anthropicModel || config.MODELS.defaultModel;
   const startMs = Date.now();
@@ -51,6 +51,7 @@ export async function pipeMessagesStream({ res, upstream, anthropicModel }) {
 
   // Named-event SSE writer (Anthropic format: event line + data line).
   const sse = (event, data) => {
+    if (res.writableEnded || res.destroyed) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
@@ -268,28 +269,37 @@ export async function pipeMessagesStream({ res, upstream, anthropicModel }) {
         }
       }
     }
+  } catch (e) {
+    // Client disconnected (signal aborted the upstream reader) or upstream
+    // errored mid-stream. If the client is gone, fall through quietly and
+    // skip the tail; otherwise rethrow so the route handler logs it.
+    if (!signal?.aborted && !res.destroyed && !res.writableEnded) throw e;
   } finally {
     try { reader.releaseLock(); } catch {}
   }
 
-  // Safety net: the stream ended without (or after) finish — close anything
-  // still open, then always emit message_delta + message_stop so the client
-  // gets a legal stream end.
-  closeAllOpen();
+  // If the client disconnected, skip the tail — closing blocks / message_delta
+  // / message_stop into a dead socket is pointless and would just throw.
+  if (!(res.writableEnded || res.destroyed)) {
+    // Safety net: the stream ended without (or after) finish — close anything
+    // still open, then always emit message_delta + message_stop so the client
+    // gets a legal stream end.
+    closeAllOpen();
 
-  const usageOut = {
-    input_tokens: lastUsage?.inputTokens ?? 0,
-    output_tokens: lastUsage?.outputTokens ?? 0,
-  };
-  if (typeof lastUsage?.cachedInputTokens === 'number') {
-    usageOut.cache_read_input_tokens = lastUsage.cachedInputTokens;
+    const usageOut = {
+      input_tokens: lastUsage?.inputTokens ?? 0,
+      output_tokens: lastUsage?.outputTokens ?? 0,
+    };
+    if (typeof lastUsage?.cachedInputTokens === 'number') {
+      usageOut.cache_read_input_tokens = lastUsage.cachedInputTokens;
+    }
+    sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: usageOut,
+    });
+    sse('message_stop', { type: 'message_stop' });
   }
-  sse('message_delta', {
-    type: 'message_delta',
-    delta: { stop_reason: stopReason, stop_sequence: null },
-    usage: usageOut,
-  });
-  sse('message_stop', { type: 'message_stop' });
 
   // Surface captured usage/finish for telemetry (same shape pipeStream returns;
   // finishReasons in the openai-style vocabulary telemetry expects).

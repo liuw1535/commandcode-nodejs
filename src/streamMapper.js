@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 const { randomUUID } = crypto;
 
 function sseData(res, obj) {
+  if (res.writableEnded || res.destroyed) return;
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
 }
 
@@ -21,7 +22,7 @@ function mapFinish(fr) {
 //   upstream: fetch Response (body is a ReadableStream)
 //   openaiModel: model name to echo back
 //   includeUsage: whether to emit a usage chunk at the end
-export async function pipeStream({ res, upstream, openaiModel, includeUsage }) {
+export async function pipeStream({ res, upstream, openaiModel, includeUsage, signal }) {
   const id = 'chatcmpl-' + randomUUID();
   const created = Math.floor(Date.now() / 1000);
   const startMs = Date.now();
@@ -153,30 +154,39 @@ export async function pipeStream({ res, upstream, openaiModel, includeUsage }) {
         }
       }
     }
+  } catch (e) {
+    // Client disconnected (signal aborted the upstream reader) or upstream
+    // errored mid-stream. If the client is gone, fall through quietly and
+    // skip the tail; otherwise rethrow so the route handler logs it.
+    if (!signal?.aborted && !res.destroyed && !res.writableEnded) throw e;
   } finally {
     try { reader.releaseLock(); } catch {}
   }
 
-  // final chunk with finish_reason
-  sseData(res, {
-    id, object: 'chat.completion.chunk', created, model: openaiModel,
-    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-  });
-
-  // optional usage chunk
-  if (includeUsage && lastUsage) {
+  // If the client disconnected, skip the tail — writing [DONE] / usage into
+  // a dead socket is pointless and would just throw.
+  if (!(res.writableEnded || res.destroyed)) {
+    // final chunk with finish_reason
     sseData(res, {
       id, object: 'chat.completion.chunk', created, model: openaiModel,
-      choices: [],
-      usage: {
-        prompt_tokens: lastUsage.inputTokens ?? 0,
-        completion_tokens: lastUsage.outputTokens ?? 0,
-        total_tokens: lastUsage.totalTokens ?? ((lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0)),
-      },
+      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
     });
-  }
 
-  res.write('data: [DONE]\n\n');
+    // optional usage chunk
+    if (includeUsage && lastUsage) {
+      sseData(res, {
+        id, object: 'chat.completion.chunk', created, model: openaiModel,
+        choices: [],
+        usage: {
+          prompt_tokens: lastUsage.inputTokens ?? 0,
+          completion_tokens: lastUsage.outputTokens ?? 0,
+          total_tokens: lastUsage.totalTokens ?? ((lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0)),
+        },
+      });
+    }
+
+    res.write('data: [DONE]\n\n');
+  }
 
   // Surface captured usage/finish so the caller can emit telemetry.
   return {

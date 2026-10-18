@@ -55,7 +55,7 @@ function mapFinishToStatus(fr) {
 //   upstream: fetch Response (body is a ReadableStream)
 //   openaiModel: model name to echo back
 //   responsesReq: original request (used for reasoning effort echo + status)
-export async function pipeResponsesStream({ res, upstream, openaiModel, responsesReq }) {
+export async function pipeResponsesStream({ res, upstream, openaiModel, responsesReq, signal }) {
   const respId = shortId('resp_', 48);
   const createdAt = Math.floor(Date.now() / 1000);
   const startMs = Date.now();
@@ -66,6 +66,7 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
   let seq = 0;
   const sseData = (obj) => {
     obj.sequence_number = seq++;
+    if (res.writableEnded || res.destroyed) return;
     res.write(`data: ${JSON.stringify(obj)}\n\n`);
   };
 
@@ -397,8 +398,27 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
         }
       }
     }
+  } catch (e) {
+    // Client disconnected (signal aborted the upstream reader) or upstream
+    // errored mid-stream. If the client is gone, fall through quietly and
+    // skip the tail; otherwise rethrow so the route handler logs it.
+    if (!signal?.aborted && !res.destroyed && !res.writableEnded) throw e;
   } finally {
     try { reader.releaseLock(); } catch {}
+  }
+
+  // If the client disconnected, skip the tail — building/emitting
+  // response.completed into a dead socket is pointless and would just throw.
+  if (res.writableEnded || res.destroyed) {
+    return {
+      inputTokens: lastUsage?.inputTokens ?? null,
+      outputTokens: lastUsage?.outputTokens ?? null,
+      totalTokens: lastUsage?.totalTokens ?? null,
+      cachedInputTokens: lastUsage?.cachedInputTokens ?? null,
+      finishReasons: [finishReason],
+      ttftMs,
+      durationMs: Date.now() - startMs,
+    };
   }
 
   // Safety net: close anything still open if the stream ended without a
