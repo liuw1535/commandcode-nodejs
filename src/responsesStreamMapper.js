@@ -36,6 +36,7 @@
 // not the cumulative stream text.
 import crypto from 'node:crypto';
 import config from '../config.js';
+import { mapUsage, buildResponseObject } from './responsesConverter.js';
 
 const { randomUUID } = crypto;
 
@@ -67,7 +68,10 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
   const sseData = (obj) => {
     obj.sequence_number = seq++;
     if (res.writableEnded || res.destroyed) return;
-    res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    // Official Responses SSE emits both an `event:` line (the event type)
+    // and a `data:` line (the full object). Strict SSE clients dispatch on
+    // the `event:` line; the object's `type` duplicates it for others.
+    res.write(`event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`);
   };
 
   // Accumulators for the final response.completed payload + telemetry.
@@ -183,7 +187,7 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
       item_id: msgState.id,
       output_index: msgState.outputIndex,
       content_index: msgState.contentIndex,
-      part: { type: 'output_text', text: '', annotations: [] },
+      part: { type: 'output_text', text: '', annotations: [], logprobs: [] },
     });
   }
 
@@ -202,14 +206,14 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
       item_id: msgState.id,
       output_index: msgState.outputIndex,
       content_index: msgState.contentIndex,
-      part: { type: 'output_text', text: msgState.text, annotations: [] },
+      part: { type: 'output_text', text: msgState.text, annotations: [], logprobs: [] },
     });
     const item = {
       type: 'message',
       id: msgState.id,
       role: 'assistant',
       status: 'completed',
-      content: [{ type: 'output_text', text: msgState.text, annotations: [] }],
+      content: [{ type: 'output_text', text: msgState.text, annotations: [], logprobs: [] }],
     };
     sseData({
       type: 'response.output_item.done',
@@ -260,7 +264,7 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
   function closeTool(t) {
     if (!t.open) return;
     t.open = false;
-    const args = (t.input != null) ? JSON.stringify(t.input) : (t.args || '');
+    const args = (t.input != null) ? JSON.stringify(t.input) : (t.args || '{}');
     sseData({
       type: 'response.function_call_arguments.done',
       item_id: t.id,
@@ -438,24 +442,20 @@ export async function pipeResponsesStream({ res, upstream, openaiModel, response
       id: shortId('msg_'),
       role: 'assistant',
       status: 'completed',
-      content: [{ type: 'output_text', text: '', annotations: [] }],
+      content: [{ type: 'output_text', text: '', annotations: [], logprobs: [] }],
     });
   }
 
-  const completed = baseResponse(status);
-  completed.output = output;
-  if (status === 'incomplete') completed.incomplete_details = { reason: 'max_output_tokens' };
-  if (responsesReq?.reasoning?.effort) completed.reasoning = { effort: responsesReq.reasoning.effort };
-  if (lastUsage) {
-    completed.usage = {
-      input_tokens: lastUsage.inputTokens ?? 0,
-      output_tokens: lastUsage.outputTokens ?? 0,
-      total_tokens: lastUsage.totalTokens ?? ((lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0)),
-    };
-    if (typeof lastUsage.cachedInputTokens === 'number') {
-      completed.usage.input_tokens_details = { cached_tokens: lastUsage.cachedInputTokens };
-    }
-  }
+  const completed = buildResponseObject({
+    id: respId,
+    createdAt,
+    status,
+    incompleteDetails: status === 'incomplete' ? { reason: 'max_output_tokens' } : undefined,
+    model: openaiModel || config.MODELS.defaultModel,
+    output,
+    usage: lastUsage,
+    responsesReq,
+  });
 
   sseData({ type: 'response.completed', response: completed });
 

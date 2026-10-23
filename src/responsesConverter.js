@@ -57,11 +57,13 @@ function partToCcBlock(part) {
       return { type: 'image', source: { type: 'url', url: part.file_id } };
     }
     case 'input_file':
-      // Best-effort passthrough; commandcode has no first-class file block.
-      if (part.file_data) {
-        return { type: 'text', text: `[file: ${part.filename || part.file_id || 'unknown'}]` };
-      }
-      if (part.file_url) return { type: 'image', source: { type: 'url', url: part.file_url } };
+      // commandcode has no first-class file input block, so we cannot carry
+      // file content faithfully. Rather than silently turning a file into a
+      // fake image (file_url) or a lossy `[file: name]` text placeholder
+      // (file_data), we log a warning and drop the part entirely. Sending
+      // mangled content upstream would only corrupt the model's context.
+      // Clients that need files should inline the content as text instead.
+      log.warn(`[responses] input_file is not supported upstream and was dropped (filename=${part.filename || part.file_id || part.file_url || 'unknown'})`);
       return null;
     default:
       return null;
@@ -115,6 +117,38 @@ function toCcTools(responsesTools) {
   return out.length ? out : undefined;
 }
 
+// Extract plain text from a system/developer `instructions`-style value,
+// which the Responses API allows as either a string or an array of input
+// items (each a {role/content} message or a typed part). Used for the
+// top-level `instructions` field and for system/developer input items so
+// both forms share one extraction path.
+function extractItemText(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value)) return '';
+  const texts = [];
+  for (const el of value) {
+    if (el == null) continue;
+    if (typeof el === 'string') { texts.push(el); continue; }
+    // EasyInputMessage / Message item: {role, content:string|[parts]}.
+    if (el.role && el.content != null) {
+      if (typeof el.content === 'string') { texts.push(el.content); continue; }
+      if (Array.isArray(el.content)) {
+        for (const p of el.content) {
+          const t = typeof p === 'string' ? p : (p && (p.type === 'input_text' || p.type === 'output_text' || p.type === 'text') ? p.text : '');
+          if (t) texts.push(t);
+        }
+      }
+      continue;
+    }
+    // Bare typed part: {type:'input_text'|'output_text'|'text', text}.
+    if (el.type === 'input_text' || el.type === 'output_text' || el.type === 'text') {
+      if (el.text) texts.push(el.text);
+    }
+  }
+  return texts.join('\n');
+}
+
 // Build a toolCallId -> toolName lookup from prior function_call input items,
 // mirroring the Chat converter's lookup from assistant tool_calls. Responses
 // FunctionCallOutput items carry only `call_id` (no name), so we resolve the
@@ -140,9 +174,11 @@ function inputToCcMessages(responsesReq) {
   // items encountered in order. (Responses treats all system/developer items
   // as instructions regardless of position.)
   const systemTexts = [];
-  if (typeof instructions === 'string' && instructions) {
-    systemTexts.push(instructions);
-  }
+  // instructions may be a plain string or an array of input items (the
+  // Responses API allows both). Reuse the shared text extractor so the array
+  // form is no longer silently dropped.
+  const instrText = extractItemText(instructions);
+  if (instrText) systemTexts.push(instrText);
 
   // Normalize input into an item list. A bare string is a single user message.
   let items = [];
@@ -164,13 +200,7 @@ function inputToCcMessages(responsesReq) {
     // Message: {type:"message", role, content:[parts] | string}.
     if ((!type || type === 'message') && role) {
       if (role === 'system' || role === 'developer') {
-        const txt = typeof item.content === 'string'
-          ? item.content
-          : (Array.isArray(item.content)
-            ? item.content.filter(p => p && (p.type === 'input_text' || p.type === 'output_text' || p.type === 'text' || typeof p === 'string'))
-              .map(p => (typeof p === 'string' ? p : p.text || ''))
-              .join('\n')
-            : '');
+        const txt = extractItemText(item.content);
         if (txt) systemTexts.push(txt);
       } else if (role === 'user' || role === 'assistant') {
         const blocks = contentPartsToCcBlocks(item.content);
@@ -199,11 +229,34 @@ function inputToCcMessages(responsesReq) {
     // FunctionCallOutput: {type:"function_call_output", call_id, output}.
     // Maps to a tool-role message with a tool-result block.
     if (type === 'function_call_output') {
-      const outText = typeof item.output === 'string'
-        ? item.output
-        : (Array.isArray(item.output)
-          ? item.output.map(p => (typeof p === 'string' ? p : p?.text || '')).join('\n')
-          : JSON.stringify(item.output ?? ''));
+      let outText = '';
+      if (typeof item.output === 'string') {
+        outText = item.output;
+      } else if (Array.isArray(item.output)) {
+        // output may be a string or an array of input_text/input_image/
+        // input_file parts. Text parts are joined; non-text parts cannot be
+        // represented in a tool-result and are dropped with a warning.
+        const texts = [];
+        let droppedNonText = false;
+        for (const p of item.output) {
+          if (typeof p === 'string') { texts.push(p); continue; }
+          if (!p) continue;
+          if (p.type === 'input_text' || p.type === 'output_text' || p.type === 'text') {
+            if (p.text) texts.push(p.text);
+          } else if (p.type === 'input_image' || p.type === 'input_file') {
+            droppedNonText = true;
+          } else if (p.text) {
+            // Unknown part that still carries text — best effort.
+            texts.push(p.text);
+          }
+        }
+        if (droppedNonText) {
+          log.warn(`[responses] function_call_output for ${item.call_id || 'unknown'} had non-text parts (input_image/input_file) that were dropped; commandcode tool results are text-only`);
+        }
+        outText = texts.join('\n');
+      } else {
+        outText = JSON.stringify(item.output ?? '');
+      }
       const toolName = callIdNames.get(item.call_id) || '';
       ccMessages.push({
         role: 'tool',
@@ -218,14 +271,17 @@ function inputToCcMessages(responsesReq) {
     }
 
     // Reasoning: {type:"reasoning", summary:[{type:"summary_text",text}], encrypted_content}.
-    // Reconstruct as an assistant reasoning block so multi-turn history keeps it.
+    // Only the human-readable summary text is reconstructed as an assistant
+    // reasoning block. encrypted_content is an opaque OpenAI payload (not
+    // readable chain-of-thought) and must NOT be sent as reasoning text —
+    // doing so would pollute the model context. A reasoning item with no
+    // summary is dropped entirely rather than synthesized from encrypted data.
     if (type === 'reasoning') {
       const summary = Array.isArray(item.summary)
         ? item.summary.map(s => (s && (s.text || s.content)) || '').filter(Boolean).join('\n')
         : '';
-      const text = summary || item.encrypted_content || '';
-      if (text) {
-        ccMessages.push({ role: 'assistant', content: [{ type: 'reasoning', text }] });
+      if (summary) {
+        ccMessages.push({ role: 'assistant', content: [{ type: 'reasoning', text: summary }] });
       }
       continue;
     }
@@ -276,6 +332,83 @@ export function responsesToCommandCode(responsesReq, session) {
   return ccBody;
 }
 
+// --- response side: shared helpers ---
+
+// Map commandcode usage (from finish/finish-step events) into the official
+// Responses usage object. Shared by both the non-streaming aggregator and
+// the streaming response.completed tail so the fields never drift apart.
+//
+//   input_tokens / output_tokens / total_tokens        — always present
+//   input_tokens_details.cached_tokens                 — when upstream reports cacheReadTokens
+//   input_tokens_details.cache_write_tokens             — when upstream reports cacheWriteTokens
+//   output_tokens_details.reasoning_tokens             — when upstream reports reasoningTokens
+export function mapUsage(usage) {
+  if (!usage) return undefined;
+  const inputTokens = usage.inputTokens ?? 0;
+  const outputTokens = usage.outputTokens ?? 0;
+  const total = usage.totalTokens ?? (inputTokens + outputTokens);
+  const out = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: total,
+  };
+  const cached = usage.cachedInputTokens ?? usage.cacheReadTokens;
+  const cacheWrite = usage.cacheWriteTokens;
+  if (typeof cached === 'number' || typeof cacheWrite === 'number') {
+    out.input_tokens_details = {};
+    if (typeof cached === 'number') out.input_tokens_details.cached_tokens = cached;
+    if (typeof cacheWrite === 'number') out.input_tokens_details.cache_write_tokens = cacheWrite;
+  }
+  if (typeof usage.reasoningTokens === 'number') {
+    out.output_tokens_details = { reasoning_tokens: usage.reasoningTokens };
+  }
+  return out;
+}
+
+// Build a Response object with the fields the real Responses API returns.
+// Core fields (id/object/created_at/status/model/output) are always present;
+// optional echo fields are filled only when the client supplied them or when
+// we have the data (usage, reasoning effort). This keeps the non-streaming
+// aggregator and the streaming response.completed payload in lockstep.
+export function buildResponseObject({
+  id, createdAt, status, incompleteDetails, model, output, usage, responsesReq,
+}) {
+  const resp = {
+    id,
+    object: 'response',
+    created_at: createdAt,
+    status,
+    model,
+    output,
+  };
+  if (incompleteDetails) resp.incomplete_details = incompleteDetails;
+
+  const req = responsesReq || {};
+  // Echo back request fields the real Response object carries.
+  if (req.instructions != null) resp.instructions = req.instructions;
+  if (req.max_output_tokens != null) resp.max_output_tokens = req.max_output_tokens;
+  if (typeof req.temperature === 'number') resp.temperature = req.temperature;
+  if (typeof req.top_p === 'number') resp.top_p = req.top_p;
+  if (typeof req.parallel_tool_calls === 'boolean') resp.parallel_tool_calls = req.parallel_tool_calls;
+  if (req.tool_choice != null) resp.tool_choice = req.tool_choice;
+  if (Array.isArray(req.tools)) resp.tools = req.tools;
+  if (req.text != null) resp.text = req.text;
+  if (typeof req.truncation === 'string') resp.truncation = req.truncation;
+  if (typeof req.store === 'boolean') resp.store = req.store;
+  if (req.user != null) resp.user = req.user;
+  if (req.metadata != null) resp.metadata = req.metadata;
+
+  // Reasoning effort echo (only if the client requested reasoning).
+  if (req.reasoning?.effort) {
+    resp.reasoning = { effort: req.reasoning.effort };
+  }
+
+  const usageObj = mapUsage(usage);
+  if (usageObj) resp.usage = usageObj;
+
+  return resp;
+}
+
 // --- response side: commandcode events -> Responses object (non-streaming) ---
 
 // Aggregate commandcode SSE events into a non-streaming OpenAI Responses
@@ -310,7 +443,7 @@ export function commandCodeEventsToResponses(events, openaiModel, responsesReq) 
         id: shortId('msg_'),
         role: 'assistant',
         status: 'completed',
-        content: [{ type: 'output_text', text: seg.text, annotations: [] }],
+        content: [{ type: 'output_text', text: seg.text, annotations: [], logprobs: [] }],
       });
     }
     seg = null;
@@ -360,7 +493,7 @@ export function commandCodeEventsToResponses(events, openaiModel, responsesReq) 
       id: shortId('msg_'),
       role: 'assistant',
       status: 'completed',
-      content: [{ type: 'output_text', text: '', annotations: [] }],
+      content: [{ type: 'output_text', text: '', annotations: [], logprobs: [] }],
     });
   }
 
@@ -374,33 +507,18 @@ export function commandCodeEventsToResponses(events, openaiModel, responsesReq) 
     incompleteDetails = { reason: 'max_output_tokens' };
   }
 
-  const resp = {
+  const resp = buildResponseObject({
     id: shortId('resp_', 48),
-    object: 'response',
-    created_at: Math.floor(Date.now() / 1000),
+    createdAt: Math.floor(Date.now() / 1000),
     status,
+    incompleteDetails,
     model: openaiModel || config.MODELS.defaultModel,
     output,
-  };
-  if (incompleteDetails) resp.incomplete_details = incompleteDetails;
-
-  // Reasoning effort echo (only if the client requested reasoning).
-  if (responsesReq?.reasoning?.effort) {
-    resp.reasoning = { effort: responsesReq.reasoning.effort };
-  }
-
-  if (usage) {
-    resp.usage = {
-      input_tokens: usage.inputTokens ?? 0,
-      output_tokens: usage.outputTokens ?? 0,
-      total_tokens: usage.totalTokens ?? ((usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)),
-    };
-    if (typeof usage.cachedInputTokens === 'number') {
-      resp.usage.input_tokens_details = { cached_tokens: usage.cachedInputTokens };
-    }
-  }
+    usage,
+    responsesReq,
+  });
 
   return resp;
 }
 
-export default { mapModel, responsesToCommandCode, commandCodeEventsToResponses };
+export default { mapModel, responsesToCommandCode, commandCodeEventsToResponses, mapUsage, buildResponseObject };
