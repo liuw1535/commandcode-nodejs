@@ -7,6 +7,7 @@ import config from '../config.js';
 import log from '../logger.js';
 import { emitStartupSpans, emitWarmupApiSpans } from './telemetry.js';
 import sessionStore from './sessionStore.js';
+import { parseQuotaFromBilling, windowLabel, fmtReset, fmtDuration } from './credPool.js';
 
 const { randomUUID } = crypto;
 
@@ -76,7 +77,8 @@ function makeMachineIdentity() {
 // Assemble the full per-process session: machine identity (loaded from disk if
 // available, else freshly generated + persisted) plus per-launch ephemera
 // (sessionId / threadId / pid) that a real CLI regenerates every launch.
-function makeSession(token) {
+function makeSession(token, name) {
+  const label = name || (token ? token.slice(-6) : 'unknown');
   // Per-launch: one session id + one conversation thread per process.
   const sessionId = 'sess_' + randomHex(8);
   // Per-credential thread id: stays stable across a "conversation" the way the
@@ -92,11 +94,11 @@ function makeSession(token) {
     identity = stored;
     // If config pins a slug, it wins over the persisted one.
     if (config.PROJECT_SLUG) identity.projectSlug = config.PROJECT_SLUG;
-    log.info(`[fingerprint] reused persisted machine identity (thumbmark=${identity.thumbmark.slice(0, 8)}...)`);
+    log.info(`[fingerprint] ${label} reused persisted machine identity (thumbmark=${identity.thumbmark.slice(0, 8)}..., slug=${identity.projectSlug})`);
   } else {
     identity = makeMachineIdentity();
     if (token) sessionStore.save(token, identity);
-    log.info(`[fingerprint] generated new machine identity (thumbmark=${identity.thumbmark.slice(0, 8)}...)`);
+    log.info(`[fingerprint] ${label} generated new machine identity (thumbmark=${identity.thumbmark.slice(0, 8)}..., slug=${identity.projectSlug})`);
   }
 
   return {
@@ -122,13 +124,17 @@ function makeSession(token) {
     // threshold = WARMUP_IDLE_ROTATE_MS * (1 + idleJitter). Prevents all
     // credentials from rotating in lockstep (a periodicity tell).
     idleJitter: Math.random() * 0.4 - 0.2,
+    // Last quota finding from /alpha/billing/credits (null = within limits).
+    // Set by warmup(); consumed by upstream.js/credPool so a credential that
+    // is out of quota is skipped before a generate is even attempted.
+    quota: null,
   };
 }
 
-function getSession(token) {
+function getSession(token, name) {
   let s = sessions.get(token);
   if (!s) {
-    s = makeSession(token);
+    s = makeSession(token, name);
     sessions.set(token, s);
   }
   return s;
@@ -171,8 +177,8 @@ async function ccFetch(path, token, init = {}) {
 // Run the full startup telemetry sequence for a credential. Best-effort.
 // Also emits OTel startup + api spans (axiom + claicode), mirroring the CLI.
 export async function warmup(token, name) {
-  const s = getSession(token);
   const label = name || token.slice(-6);
+  const s = getSession(token, name);
   const apiCalls = [];
   try {
     // Emit the session:cli + command:interactive startup span first, like the CLI.
@@ -234,7 +240,18 @@ export async function warmup(token, name) {
     if (cred?.ok) {
       const j = await cred.json().catch(() => null);
       const c = j?.credits;
-      if (c) log.info(`[fingerprint] ${label} credits monthly=${c.monthlyCredits} weeklyUsed=${j?.windowLimits?.weekly?.used}/${j?.windowLimits?.weekly?.cap}`);
+      const wl = j?.windowLimits;
+      if (c) {
+        log.info(`[fingerprint] ${label} credits monthly=${c.monthlyCredits} weeklyUsed=${wl?.weekly?.used}/${wl?.weekly?.cap} fiveHourUsed=${wl?.fiveHour?.used}/${wl?.fiveHour?.cap}${wl?.exceeded ? ` exceeded=${wl.exceeded}` : ''}`);
+      }
+      // Quota pre-check: if the upstream already reports an exceeded window,
+      // remember it on the session so the request path can skip this
+      // credential without spending a guaranteed-429 generate call.
+      const quota = parseQuotaFromBilling(j);
+      s.quota = quota;
+      if (quota) {
+        log.warn(`[fingerprint] ${label} ${windowLabel(quota.window)} quota already exhausted${quota.used != null && quota.limit != null ? ` (${quota.used}/${quota.limit})` : ''}, resets at ${fmtReset(quota.resetAt)} (${fmtDuration(quota.resetAt - Date.now())} left)`);
+      }
     }
 
     s.warmed = true;
@@ -251,8 +268,8 @@ export async function warmup(token, name) {
 // matching the captured CLI (the header carries the thread/conversation id,
 // NOT the sess_ session id). Returns traceId + chatSpanId so the OTel span
 // emitted afterwards shares the same traceparent identity.
-export function buildGenerateHeaders(token, sessionId, threadId) {
-  const s = getSession(token);
+export function buildGenerateHeaders(token, sessionId, threadId, name) {
+  const s = getSession(token, name);
   const traceId = randomHex(16);
   const spanId = randomHex(8);
   const traceparent = `00-${traceId}-${spanId}-01`;
@@ -293,7 +310,7 @@ export function buildGenerateHeaders(token, sessionId, threadId) {
 // so concurrent first-uses of the same token don't trigger duplicate warmups.
 // A failed warmup leaves s.warmed=false, so the next lazy use retries.
 export async function ensureWarmed(token, name, mode) {
-  const s = getSession(token);
+  const s = getSession(token, name);
   if (mode !== 'lazy' && mode !== 'lazy-async') return s; // startup / off: no-op
   if (s.warmed) return s;
   if (!s.warming) {
@@ -343,7 +360,7 @@ function rotateEphemera(s) {
 // rotated for this exact idle-gap start. This prevents a concurrent request
 // re-rotating the gap the first one just handled (duplicate startup burst).
 export async function maybeRotateOnIdle(token, name) {
-  const s = getSession(token);
+  const s = getSession(token, name);
   const now = Date.now();
   const prev = s.lastActivityAt;
   // Stamp activity for this request unconditionally so the next idle gap is
@@ -380,8 +397,8 @@ export async function maybeRotateOnIdle(token, name) {
   if (config.WARMUP_MODE === 'lazy') await s.warming;
 }
 
-export function getSessionForToken(token) {
-  return getSession(token);
+export function getSessionForToken(token, name) {
+  return getSession(token, name);
 }
 
 export default { warmup, ensureWarmed, maybeRotateOnIdle, buildGenerateHeaders, getSessionForToken };

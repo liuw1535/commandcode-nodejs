@@ -61,15 +61,19 @@ src/
 ## 凭证池策略
 
 - 启动时加载并校验凭证；无效 token 被跳过并记录告警。
-- 正常请求按可用凭证轮询。
-- `429`：同一 token 指数退避重试，默认最多 3 次；仍失败则切换到下一个 token，但不禁用。
-- `400` 且响应体包含 `insufficient credits`：禁用该 token，立即切换凭证并重试本次请求。
-- 所有 token 均被禁用时，返回 OpenAI 格式的 `503` 错误。
-- `GET /v1/credentials/status` 返回各凭证禁用状态，需要鉴权。
+- 正常请求按可用凭证轮询；发生轮换时会打印由哪个凭证实际服务了本次请求，以及该凭证的指纹标识（`threadId` / `projectSlug` / `thumbmark`）。
+- **额度窗口耗尽**（`429` 且响应体带 `rateLimit.window` = `weekly` / `fiveHour`，或预热时 `/alpha/billing/credits` 的 `windowLimits.exceeded` 已置位）：不再退避重试，立刻禁用该 token 并切换到下一个。
+  - 禁用状态会写回 `credentials.json`：`enabled: false` 加 `exhaustedUntil` / `exhaustedWindow` / `exhaustedAt`（原子写入，其它字段原样保留）。
+  - 进程重启后仍会跳过冷却中的 token，不会再浪费一次必然失败的 `generate` 请求。
+  - 到达上游给出的窗口重置时间后自动恢复（`enabled: true`，并清除 `exhausted*` 字段）；如手动把 `enabled` 改回 `true`，则视为人工覆盖，冷却记录被丢弃。
+- **临时限流**（`429` 但不带窗口信息）：同一 token 指数退避重试，默认最多 3 次；仍失败则切换到下一个 token，但不禁用。
+- `400` 且响应体包含 `insufficient credits`：禁用该 token（本进程内有效，无重置时间），立即切换凭证并重试本次请求。
+- 所有 token 均不可用时，返回 `503`，错误信息里带上各凭证的冷却截止时间或禁用原因。
+- `GET /v1/credentials/status` 返回各凭证的 `enabled` / `disabled` / `available` / `exhausted`（窗口、重置时间、剩余毫秒、额度用量）状态，需要鉴权。
 
 ## 每凭证机器身份
 
-每个 token 首次使用时生成一套稳定的机器身份，不同凭证之间互不关联：
+每个 token 首次使用时生成一套稳定的机器身份，不同凭证之间互不关联。指纹相关日志都会带上凭证名（如 `[fingerprint] acct-2-go reused persisted machine identity ...`），轮换后不会出现"用第一个账号指纹"的情况：
 
 - 独立的 `installId`、`sessionId`、`threadId`
 - MAC、用户名、主机名和 git 邮箱的 SHA256 哈希，以及派生 `thumbmark`
@@ -84,7 +88,7 @@ src/
 ## 启动流程
 
 1. 加载配置并校验环境。
-2. 加载凭证池，跳过无效和禁用项。
+2. 加载凭证池，跳过无效项、手动禁用项和仍在额度冷却期的项。
 3. 同步拉取一次模型列表；失败时记录告警并继续启动。
 4. 初始化 HTTP 服务器。
 5. 后台执行指纹模拟、生命周期事件、指纹记录和 billing 探测。

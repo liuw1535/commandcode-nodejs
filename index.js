@@ -2,7 +2,7 @@
 import config from './config.js';
 import log from './logger.js';
 import { CredentialPool } from './src/credPool.js';
-import { warmup } from './src/fingerprint.js';
+import { warmup, getSessionForToken } from './src/fingerprint.js';
 import { createServer } from './src/openaiServer.js';
 import { init as initModels, getModelIds } from './src/modelProvider.js';
 
@@ -34,10 +34,23 @@ async function main() {
       break;
     case 'startup':
     default: {
-      const warmupCreds = credPool.creds.filter(c => c.enabled);
-      log.info(`[startup] warmup mode=startup, warming up ${warmupCreds.length} credential(s) in background...`);
+      // Skip credentials already known to be out of quota (persisted cooldown):
+      // re-warming them would only re-probe billing for an account we already
+      // know is blocked until its window resets.
+      const warmupCreds = credPool.availableCreds();
+      const cooling = credPool.creds.length - warmupCreds.length;
+      log.info(`[startup] warmup mode=startup, warming up ${warmupCreds.length} credential(s) in background${cooling > 0 ? ` (${cooling} cooling down, skipped)` : ''}...`);
       Promise.allSettled(warmupCreds.map(c => warmup(c.token, c.name)))
-        .then(() => log.info('[startup] warmup complete'));
+        .then(() => {
+          // The warmup already fetched /alpha/billing/credits for each token;
+          // apply any quota finding so the pool disables + persists it before
+          // the first request arrives.
+          for (const c of warmupCreds) {
+            const quota = getSessionForToken(c.token, c.name)?.quota;
+            if (quota) credPool.markQuotaExhausted(c.token, quota);
+          }
+          log.info('[startup] warmup complete');
+        });
       break;
     }
   }

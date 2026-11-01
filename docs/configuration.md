@@ -21,8 +21,8 @@
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `AUTH_TOKEN` | 空 | 本地鉴权密钥；未设置时关闭鉴权 |
 | `MAX_BODY_BYTES` | `104857600` | 请求体大小上限，超过返回 `413` |
-| `CREDENTIALS_FILE` | `./credentials.json` | 凭证文件路径 |
-| `STATE_DIR` | `./.state` | 凭证状态目录 |
+| `CREDENTIALS_FILE` | `./credentials.json` | 凭证文件路径（额度冷却状态也会写回此文件） |
+| `STATE_DIR` | `./.state` | 每凭证指纹状态目录 |
 | `COMMANDCODE_BASE` | `https://api.commandcode.ai` | 上游地址 |
 | `MODELS_REFRESH_MS` | `600000` | 模型列表刷新间隔；`0` 关闭定时刷新 |
 | `REASONING_EFFORT` | `high` | 默认推理强度 |
@@ -34,7 +34,7 @@
 |---|---|---|
 | `COMMANDCODE_USER_AGENT` | `cli` | 模拟的 CLI `User-Agent` |
 | `CLI_VERSION` | `1.50.1` | 模拟的 CLI 版本号 |
-| `RETRY_429_MAX` | `3` | 同一 token 的 429 重试次数 |
+| `RETRY_429_MAX` | `3` | 临时限流的 429 重试次数（额度窗口耗尽的 429 不退避重试） |
 | `RETRY_429_BASE_MS` | `1000` | 429 指数退避基数 |
 
 ## 指纹与遥测

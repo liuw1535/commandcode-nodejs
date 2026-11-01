@@ -188,6 +188,9 @@ export function createServer(credPool) {
         captured = result.captured;
       } catch (e) {
         const status = clientSignal.aborted ? 499 : (e.statusCode || 502);
+        // Quota exhaustion knows exactly when the window resets — tell the
+        // client instead of making it guess a backoff.
+        if (e.retryAfterMs) res.setHeader('retry-after', String(Math.max(1, Math.ceil(e.retryAfterMs / 1000))));
         openaiError(res, status, e.message || 'upstream error', null, 'invalid_request_error');
         return done(status);
       }
@@ -310,6 +313,9 @@ export function createServer(credPool) {
         captured = result.captured;
       } catch (e) {
         const status = clientSignal.aborted ? 499 : (e.statusCode || 502);
+        // Quota exhaustion knows exactly when the window resets — tell the
+        // client instead of making it guess a backoff.
+        if (e.retryAfterMs) res.setHeader('retry-after', String(Math.max(1, Math.ceil(e.retryAfterMs / 1000))));
         openaiError(res, status, e.message || 'upstream error', null, 'invalid_request_error');
         return done(status);
       }
@@ -418,6 +424,9 @@ export function createServer(credPool) {
         captured = result.captured;
       } catch (e) {
         const status = clientSignal.aborted ? 499 : (e.statusCode || 502);
+        // Quota exhaustion knows exactly when the window resets — tell the
+        // client instead of making it guess a backoff.
+        if (e.retryAfterMs) res.setHeader('retry-after', String(Math.max(1, Math.ceil(e.retryAfterMs / 1000))));
         anthropicError(res, status, anthropicErrorType(status), e.message || 'upstream error');
         return done(status);
       }

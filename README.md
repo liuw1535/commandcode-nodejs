@@ -36,10 +36,36 @@ npm start
 
 - `token` 必须以 `user_` 开头。
 - `name` 可选，仅用于日志显示。
-- `enabled` 可选，默认 `true`；设为 `false` 后该凭证不参与轮询。
+- `enabled` 可选，默认 `true`；设为 `false` 后该凭证不参与轮询（手动关闭）。
+- `exhaustedUntil` / `exhaustedWindow` / `exhaustedAt` 由服务自动写入，用于记录额度窗口冷却状态，一般不需要手改。
 - 可用 `CREDENTIALS_FILE` 指定其他凭证文件路径。
 
-服务会自动轮询可用凭证；遇到 429 时退避重试，遇到额度耗尽时禁用对应凭证并切换到下一个。
+服务会自动轮询可用凭证：
+
+- **额度窗口耗尽**（周额度 / 5 小时额度）：上游返回 `429` 且带 `rateLimit.window`，或预热时 `/alpha/billing/credits` 已经报 `windowLimits.exceeded`。此时不再做无意义的退避重试，立即禁用该凭证并切换到下一个，同时把冷却状态写回 `credentials.json`：
+
+  ```json
+  {
+    "token": "user_xxxxx...",
+    "name": "acct-1",
+    "enabled": false,
+    "exhaustedUntil": 1793541523009,
+    "exhaustedWindow": "weekly",
+    "exhaustedAt": 1793503232488
+  }
+  ```
+
+  重启进程后会继续跳过冷却中的凭证；到达 `exhaustedUntil`（上游给出的窗口重置时间）后自动恢复并清除这几个字段。手动把 `enabled` 改回 `true` 表示人工覆盖，冷却记录会被丢弃。
+- **临时限流**（`429` 但没有窗口信息）：同一凭证指数退避重试（默认 3 次），仍失败则切换到下一个凭证。
+- `400` 且响应体包含 `insufficient credits`：禁用该凭证并切换（无重置时间，本进程内有效）。
+- 轮换发生时会打印实际服务本次请求的凭证及其指纹标识，例如：
+
+  ```text
+  [warn] [credpool] acct-goat weekly quota exhausted (35/35) — disabled until 2026-11-01T13:58:43.009Z (10h38m left), persisted to ./credentials.json
+  [warn] [credpool] switching away from acct-goat → acct-2-go
+  [info] [credpool] request served by acct-2-go (credential attempt 2/2)
+  [info] [upstream] served by acct-2-go (attempt 2) threadId=7cfd0bda-... projectSlug=c-users-ofwe0-desktop thumbmark=69438c61...
+  ```
 
 ## 常用配置
 

@@ -11,7 +11,9 @@
 // /v1/responses route reuses this verbatim — only its converter + stream
 // mapper differ.
 import config from '../config.js';
+import log from '../logger.js';
 import { ensureWarmed, maybeRotateOnIdle, getSessionForToken, buildGenerateHeaders } from './fingerprint.js';
+import { labelOf } from './credPool.js';
 import { emitApiSpan } from './telemetry.js';
 
 // Send a commandcode /alpha/generate request with full credential rotation +
@@ -27,17 +29,32 @@ import { emitApiSpan } from './telemetry.js';
 export async function sendGenerate(credPool, buildBody, signal) {
   let captured = null;
 
-  const upstreamRes = await credPool.requestWithRotation(async (token) => {
-    const cred = credPool.find(token);
+  const { res: upstreamRes, cred, attempts } = await credPool.requestWithRotation(async (token) => {
+    const credForToken = credPool.find(token);
     // If this credential has been idle past the configured threshold, rotate
     // its ephemeral session identity + emit a fresh startup burst BEFORE this
     // request goes out (simulating a CLI restart). No-op when disabled.
-    await maybeRotateOnIdle(token, cred?.name);
-    await ensureWarmed(token, cred?.name, config.WARMUP_MODE);
-    const session = getSessionForToken(token);
+    await maybeRotateOnIdle(token, credForToken?.name);
+    await ensureWarmed(token, credForToken?.name, config.WARMUP_MODE);
+    const session = getSessionForToken(token, credForToken?.name);
+    // Quota pre-check: the fingerprint warmup already reads
+    // /alpha/billing/credits. If that (or an earlier 429) says a window is
+    // exhausted, do NOT spend a guaranteed-429 generate call on this
+    // credential — surface it to the pool, which disables it until reset and
+    // rotates to the next one.
+    if (session?.quota) {
+      if (session.quota.resetAt > Date.now()) {
+        const e = new Error(`quota exhausted (${session.quota.window || 'window'} limit) detected during warmup`);
+        e.code = 'QUOTA_EXHAUSTED';
+        e.quota = session.quota;
+        throw e;
+      }
+      // The window has reset since that finding — forget it and carry on.
+      session.quota = null;
+    }
     const ccBody = buildBody(session, token);
     //console.log(JSON.stringify(ccBody, null, 2))
-    const headers = buildGenerateHeaders(token, session.sessionId, ccBody.threadId);
+    const headers = buildGenerateHeaders(token, session.sessionId, ccBody.threadId, credForToken?.name);
     // buildGenerateHeaders tucks {traceId, spanId} under a non-HTTP _trace key
     // so the caller can reuse them in the OTel span; strip it before sending.
     const trace = headers._trace;
@@ -57,6 +74,14 @@ export async function sendGenerate(credPool, buildBody, signal) {
       ...(signal ? { signal } : {}),
     });
   });
+
+  // When rotation happened, name the credential that actually served this
+  // request *and* the fingerprint identity it used. Without this the logs only
+  // showed the credential that was rejected, which made it look like failed
+  // credentials were still serving traffic.
+  if (attempts > 1 && captured) {
+    log.info(`[upstream] served by ${labelOf(cred)} (attempt ${attempts}) threadId=${captured.threadId} projectSlug=${captured.session?.projectSlug} thumbmark=${String(captured.session?.thumbmark || '').slice(0, 8)}...`);
+  }
 
   return { upstreamRes, captured };
 }
